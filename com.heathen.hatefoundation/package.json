@@ -1,0 +1,22 @@
+{
+  "name": "com.heathen.hatefoundation",
+  "version": "0.1.0",
+  "displayName": "Attribute gpTag Engine Foundation",
+  "description": "Heathen Attribute [gp]Tag Engine — a data-oriented attribute/effect/ability system built on DataLens. HATE-P1 slice: Attribute State (Base/Current dedicated columns) + Instant effects on the DataLens substrate.",
+  "unity": "2021.3",
+  "author": {
+    "name": "Heathen Group",
+    "email": "support@heathen.group",
+    "url": "https://heathen.group"
+  },
+  "dependencies": {
+    "com.heathen.datalensfoundation": "0.1.0"
+  },
+  "keywords": [
+    "hate",
+    "gas",
+    "attributes",
+    "gameplay",
+    "data-oriented"
+  ]
+}

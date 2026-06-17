@@ -1,0 +1,16 @@
+{
+    "name": "Heathen.HATE.Foundation",
+    "rootNamespace": "Heathen.HATE",
+    "references": [
+        "Heathen.DataLens.Foundation"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": true
+}
