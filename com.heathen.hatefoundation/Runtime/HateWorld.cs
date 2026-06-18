@@ -61,6 +61,19 @@ namespace Heathen.HATE
         private DataView _utilityView;
         private float[] _utilityScratch;
 
+        // ── Utility AI v2 (§8 score→perturb→select, D5.2). K ability score slots + a per-actor Variance
+        //    (skill/fatigue dial), a Command override column (-1 = none), a Choice output, and a scratch
+        //    column for weighted-sum accumulation. Only allocated when abilityScoreSlots > 0. ──
+        private readonly int _abilityScoreSlots;
+        private readonly int _scoreCol0;      // first of K Float score columns (slot s = _scoreCol0 + s)
+        private readonly int _varianceCol;    // Float, per-actor skill/fatigue
+        private readonly int _commandCol;     // Int32, -1 = no command (else forced ability slot)
+        private readonly int _choiceCol;      // Int32, the chosen ability slot (-1 = none)
+        private readonly int _scratchCol;     // Float, per-consideration scratch for WeightedSum
+        private ulong[] _scoreColsUlong;      // score column indices for the argmax select pass
+        private DataView _choiceView;
+        private int[] _choiceScratch;
+
         // ── Abilities (§7): in-flight payload TASKS (a delayed effect+cue per row, fired by tick) + the
         //    cosmetic CUE output stream (§9, drained by presentation — never simulation state). ──
         private readonly DataStore _tasks;
@@ -82,12 +95,22 @@ namespace Heathen.HATE
         /// Trigger evaluation.
         /// </summary>
         public HateWorld(string[] attributeNames, string[] tagNames, int capacity)
+            : this(attributeNames, tagNames, 0, capacity) { }
+
+        /// <summary>
+        /// As the tag-aware constructor, plus <paramref name="abilityScoreSlots"/> dedicated ability-score
+        /// columns for the §8 utility-AI pipeline (D5.2): score (multi-consideration) → perturb (Variance ×
+        /// counter-based noise) → select (argmax + Command override). Pass 0 to omit the utility-AI columns.
+        /// </summary>
+        public HateWorld(string[] attributeNames, string[] tagNames, int abilityScoreSlots, int capacity)
         {
             if (attributeNames == null) throw new ArgumentNullException(nameof(attributeNames));
             if (attributeNames.Length == 0) throw new ArgumentException("Need at least one attribute.", nameof(attributeNames));
             if (tagNames == null) throw new ArgumentNullException(nameof(tagNames));
             if (tagNames.Length > 32) throw new ArgumentException("At most 32 hot tags (Int32 bitmask).", nameof(tagNames));
             if (capacity <= 0) throw new ArgumentException("Capacity must be positive.", nameof(capacity));
+            if (abilityScoreSlots < 0 || abilityScoreSlots > 64)
+                throw new ArgumentException("abilityScoreSlots must be in 0..64.", nameof(abilityScoreSlots));
 
             _attrNames = (string[])attributeNames.Clone();
             _attrIndex = new Dictionary<string, int>(attributeNames.Length);
@@ -96,7 +119,9 @@ namespace Heathen.HATE
                 _tagIndex[tagNames[t]] = t;
 
             // Actor columns: [a0.Base, a0.Current, …] (Float) then BaseTags, CurrentTags, Selected,
-            // Eligible (Int32) and Utility (Float).
+            // Eligible (Int32) and Utility (Float); then (when abilityScoreSlots>0) K Score columns
+            // (Float), Variance (Float), Command (Int32), Choice (Int32) and a WeightedSum scratch (Float).
+            _abilityScoreSlots = abilityScoreSlots;
             int attrCols = attributeNames.Length * 2;
             _baseTagsCol = attrCols;
             _currentTagsCol = attrCols + 1;
@@ -105,6 +130,16 @@ namespace Heathen.HATE
             _utilityCol = attrCols + 4;
 
             int colCount = attrCols + 5;
+            if (abilityScoreSlots > 0)
+            {
+                _scoreCol0 = colCount;
+                _varianceCol = _scoreCol0 + abilityScoreSlots;
+                _commandCol = _varianceCol + 1;
+                _choiceCol = _commandCol + 1;
+                _scratchCol = _choiceCol + 1;
+                colCount = _scratchCol + 1;
+            }
+
             var colNames = new string[colCount];
             var colTypes = new DataLensValueType[colCount];
             for (int a = 0; a < attributeNames.Length; a++)
@@ -120,6 +155,20 @@ namespace Heathen.HATE
             colNames[_selectedCol] = "Selected";       colTypes[_selectedCol] = DataLensValueType.Int32;
             colNames[_eligibleCol] = "Eligible";       colTypes[_eligibleCol] = DataLensValueType.Int32;
             colNames[_utilityCol] = "Utility";         colTypes[_utilityCol] = DataLensValueType.Float;
+            if (abilityScoreSlots > 0)
+            {
+                for (int s = 0; s < abilityScoreSlots; s++)
+                {
+                    colNames[_scoreCol0 + s] = "Score" + s; colTypes[_scoreCol0 + s] = DataLensValueType.Float;
+                }
+                colNames[_varianceCol] = "Variance"; colTypes[_varianceCol] = DataLensValueType.Float;
+                colNames[_commandCol] = "Command";   colTypes[_commandCol] = DataLensValueType.Int32;
+                colNames[_choiceCol] = "Choice";     colTypes[_choiceCol] = DataLensValueType.Int32;
+                colNames[_scratchCol] = "ScoreScratch"; colTypes[_scratchCol] = DataLensValueType.Float;
+
+                _scoreColsUlong = new ulong[abilityScoreSlots];
+                for (int s = 0; s < abilityScoreSlots; s++) _scoreColsUlong[s] = (ulong)(_scoreCol0 + s);
+            }
 
             _store = new DataStore(colNames, colTypes, (ulong)capacity);
             _lens = new Lens(0); // hardware concurrency
@@ -141,6 +190,11 @@ namespace Heathen.HATE
             _eligibleScratch = new int[capacity];
             _utilityView = new DataView(new ulong[] { (ulong)_utilityCol });
             _utilityScratch = new float[capacity];
+            if (abilityScoreSlots > 0)
+            {
+                _choiceView = new DataView(new ulong[] { (ulong)_choiceCol });
+                _choiceScratch = new int[capacity];
+            }
 
             // In-flight ability payload tasks: a row per pending (delayed) effect+cue.
             _tasksCapacity = capacity * 2;
@@ -175,7 +229,15 @@ namespace Heathen.HATE
         public int SpawnActor()
         {
             ulong row = _store.AllocRow();
-            return row == DataStore.InvalidRow ? InvalidActor : (int)row;
+            if (row == DataStore.InvalidRow) return InvalidActor;
+            if (_abilityScoreSlots > 0)
+            {
+                // Reused slots must not inherit a previous occupant's command/variance/choice.
+                _store.SetInt(row, (ulong)_commandCol, -1);
+                _store.SetInt(row, (ulong)_choiceCol, -1);
+                _store.SetFloat(row, (ulong)_varianceCol, 0f);
+            }
+            return (int)row;
         }
 
         /// <summary>Despawn an actor so its slot can be reused.</summary>
@@ -680,6 +742,180 @@ namespace Heathen.HATE
             return best;
         }
 
+        // ── Utility AI v2: score → perturb → select (§8, D5.2) ───────────────
+        // The decision is three separated, data-driven stages, each branchless column passes over ALL
+        // actors. Considerations live in the program (uniform curve passes), never in per-row data, so the
+        // hot path never does a per-row lookup or branch. The result is a plain Choice column others read.
+
+        /// <summary>Number of ability score slots this world was created with (0 = utility-AI v2 disabled).</summary>
+        public int AbilityScoreSlots => _abilityScoreSlots;
+
+        private void RequireAI()
+        {
+            if (_abilityScoreSlots <= 0)
+                throw new InvalidOperationException(
+                    "This HateWorld has no ability score slots; construct it with abilityScoreSlots > 0 to use the utility-AI pipeline.");
+        }
+
+        private int ScoreCol(int slot)
+        {
+            if (slot < 0 || slot >= _abilityScoreSlots)
+                throw new ArgumentOutOfRangeException(nameof(slot));
+            return _scoreCol0 + slot;
+        }
+
+        // ── Variance (the skill / fatigue dial, §8.4) ────────────────────────
+
+        /// <summary>Set one actor's Variance (0 = perfect play; higher = sloppier selection).</summary>
+        public void SetVariance(int actor, float variance)
+            => _store.SetFloat((ulong)actor, (ulong)RequireVarianceCol(), variance);
+
+        /// <summary>Set the Variance of every live actor in one parallel pass.</summary>
+        public ulong SetVarianceAll(float variance)
+        {
+            RequireAI();
+            return _lens.RunFloat(_store, (ulong)_varianceCol, SystemOp.Set, variance);
+        }
+
+        /// <summary>An actor's current Variance.</summary>
+        public float GetVariance(int actor)
+        {
+            _store.TryGetFloat((ulong)actor, (ulong)RequireVarianceCol(), out float v);
+            return v;
+        }
+
+        private int RequireVarianceCol() { RequireAI(); return _varianceCol; }
+
+        // ── Command override (hard "force this ability", §8.5) ───────────────
+
+        /// <summary>Force <paramref name="actor"/> to choose ability slot <paramref name="abilitySlot"/>,
+        /// overriding scoring at the next <see cref="Select"/>. Persists until cleared.</summary>
+        public void SetCommand(int actor, int abilitySlot)
+        {
+            RequireAI();
+            _store.SetInt((ulong)actor, (ulong)_commandCol, abilitySlot);
+        }
+
+        /// <summary>Clear one actor's command (return it to scored selection).</summary>
+        public void ClearCommand(int actor)
+        {
+            RequireAI();
+            _store.SetInt((ulong)actor, (ulong)_commandCol, -1);
+        }
+
+        /// <summary>Clear every live actor's command in one parallel pass.</summary>
+        public ulong ClearCommandAll()
+        {
+            RequireAI();
+            return _lens.RunInt(_store, (ulong)_commandCol, SystemOp.Set, -1);
+        }
+
+        // ── Score (multi-consideration, §8.2) ────────────────────────────────
+
+        /// <summary>
+        /// Compute the per-actor Utility for one ability into its score slot (§8.2): apply each
+        /// <see cref="Consideration"/> as a uniform DataLens curve pass over the metric attribute's Current,
+        /// aggregated per <paramref name="aggregate"/> (Product = ∏, WeightedSum = Σ weight·curve), then zero
+        /// the score for actors that fail the ability's hard <see cref="Limiters">limiters</see>
+        /// (cost/cooldown/requirement, via <see cref="EvaluateEligibility"/>). All branchless column passes;
+        /// call <see cref="RecomputeCurrent"/> first so the metric Currents are up to date.
+        /// </summary>
+        public void ScoreAbility(int slot, in AbilityDef ability, Consideration[] considerations, Aggregate aggregate)
+        {
+            RequireAI();
+            int score = ScoreCol(slot);
+
+            if (aggregate == Aggregate.Product)
+            {
+                _lens.RunFloat(_store, (ulong)score, SystemOp.Set, 1f); // product identity
+                if (considerations != null)
+                    foreach (var c in considerations)
+                        _lens.RunFloatCurved(_store, (ulong)score, SystemOp.Mul, (ulong)CurrentCol(c.MetricAttr), c.Curve);
+            }
+            else // WeightedSum
+            {
+                _lens.RunFloat(_store, (ulong)score, SystemOp.Set, 0f); // sum identity
+                if (considerations != null)
+                    foreach (var c in considerations)
+                    {
+                        // scratch = curve(metric); scratch *= weight; score += scratch.
+                        _lens.RunFloatCurved(_store, (ulong)_scratchCol, SystemOp.Set, (ulong)CurrentCol(c.MetricAttr), c.Curve);
+                        if (c.Weight != 1f) _lens.RunFloat(_store, (ulong)_scratchCol, SystemOp.Mul, c.Weight);
+                        _lens.RunFloatColumn(_store, (ulong)score, SystemOp.Add, (ulong)_scratchCol);
+                    }
+            }
+
+            // Hard eligibility: ineligible actors score 0 (the limiter gate, §8.1).
+            EvaluateEligibility(ability);
+            _lens.RunFloatWhereInt(_store, (ulong)score, SystemOp.Set, 0f, (ulong)_eligibleCol, CompareOp.Equal, 0);
+        }
+
+        // ── Perturb (the determinism ↔ variance dial, §8.4) ──────────────────
+
+        /// <summary>
+        /// Jitter every ability's score by <c>Variance[actor] × noise</c> (§8.4) so selection ranges from
+        /// perfect (Variance 0) to sloppy. Each slot draws an independent, reproducible counter-based stream
+        /// (seed + slot, keyed on row+tick), so the result is deterministic across runs/machines/replay.
+        /// Noise defaults to symmetric [-1,1) (no upward bias). Call after scoring all abilities, before
+        /// <see cref="Select"/>.
+        /// </summary>
+        public void PerturbScores(ulong seed, ulong tick, float noiseLo = -1f, float noiseHi = 1f)
+        {
+            RequireAI();
+            for (int s = 0; s < _abilityScoreSlots; s++)
+                _lens.RunFloatNoisePerturb(_store, (ulong)ScoreCol(s), SystemOp.Add, (ulong)_varianceCol,
+                    noiseLo, noiseHi, seed + (ulong)s, tick);
+        }
+
+        // ── Select (policy as data: greedy/noisy argmax + Command, §8.5) ─────
+
+        /// <summary>
+        /// Reduce the K ability score columns to a per-actor Choice (the §8.5 pick): greedy argmax across the
+        /// scores (ties to the lowest slot), with a winning score below <paramref name="minScore"/> giving
+        /// Choice -1 ("do nothing"). A per-actor Command (set via <see cref="SetCommand"/>) overrides the pick
+        /// (<c>Choice = Command>=0 ? Command : argmax</c>). One argmax pass + one override pass. Returns the
+        /// number of live actors decided.
+        /// </summary>
+        public ulong Select(float minScore = 0f)
+        {
+            RequireAI();
+            ulong n = _lens.RunFloatArgmax(_store, (ulong)_choiceCol, _scoreColsUlong, minScore, -1);
+            // Command override: where Command >= 0, Choice = Command.
+            _lens.RunIntColumn(_store, (ulong)_choiceCol, SystemOp.Set, (ulong)_commandCol,
+                (ulong)_commandCol, CompareOp.GreaterEqual, 0);
+            return n;
+        }
+
+        /// <summary>An actor's last-computed score for an ability slot (after <see cref="ScoreAbility"/>/<see cref="PerturbScores"/>).</summary>
+        public float GetScore(int actor, int slot)
+        {
+            _store.TryGetFloat((ulong)actor, (ulong)ScoreCol(slot), out float v);
+            return v;
+        }
+
+        /// <summary>An actor's chosen ability slot after <see cref="Select"/> (-1 = none).</summary>
+        public int GetChoice(int actor)
+        {
+            RequireAI();
+            _store.TryGetInt((ulong)actor, (ulong)_choiceCol, out int v);
+            return v;
+        }
+
+        /// <summary>
+        /// Bulk-copy the per-actor Choice column (after <see cref="Select"/>) into <paramref name="dest"/> in
+        /// one parallel gather — the population-scale read-back. View row i maps to the i-th live actor; recover
+        /// its handle with <see cref="ChoiceSourceActor"/>. Returns the number of choices written.
+        /// </summary>
+        public int CopyChoices(int[] dest)
+        {
+            RequireAI();
+            _lens.RefreshView(_choiceView, _store);
+            return _choiceView.CopyInts(dest);
+        }
+
+        /// <summary>Map a row in the last <see cref="CopyChoices"/> read-back back to its actor handle.</summary>
+        public int ChoiceSourceActor(int viewRow) => (int)_choiceView.SourceRow((ulong)viewRow);
+
         private bool MatchesTrigger(int currentTags, TagTrigger t)
         {
             switch (t.Mode)
@@ -736,6 +972,7 @@ namespace Heathen.HATE
             _selectedView?.Dispose();
             _eligibleView?.Dispose();
             _utilityView?.Dispose();
+            _choiceView?.Dispose();
             _recomputeCurrent?.Dispose();
             _recomputeTags?.Dispose();
             _lens?.Dispose();
