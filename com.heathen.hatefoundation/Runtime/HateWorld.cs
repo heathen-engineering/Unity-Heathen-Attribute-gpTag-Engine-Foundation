@@ -308,6 +308,7 @@ namespace Heathen.HATE
 
         private void AddActiveModifiers()
         {
+            if (_effects.LiveCount == 0) return; // no active duration effects: Current is just Base
             for (int r = 0; r < _effectsCapacity; r++)
             {
                 if (!_effects.IsValid((ulong)r)) continue;
@@ -372,6 +373,7 @@ namespace Heathen.HATE
         public void RecomputeTags()
         {
             _lens.Execute(_recomputeTags, _table);
+            if (_effects.LiveCount == 0) return; // no granting effects: CurrentTags is just BaseTags
             for (int r = 0; r < _effectsCapacity; r++)
             {
                 if (!_effects.IsValid((ulong)r)) continue;
@@ -627,6 +629,33 @@ namespace Heathen.HATE
             _store.TryGetFloat((ulong)actor, (ulong)_utilityCol, out float v);
             return v;
         }
+
+        /// <summary>
+        /// Bulk-copy the per-actor Utility column (as of the last <see cref="EvaluateUtility"/>) into
+        /// <paramref name="dest"/> in one parallel gather — the read-back for visualisation/inspection over
+        /// a whole population, instead of a per-actor <see cref="GetUtility"/> interop loop. View row i maps
+        /// to the i-th live actor; recover its handle with <see cref="DecisionSourceActor"/>. Returns the
+        /// number of scores written (the live actor count).
+        /// </summary>
+        public int CopyUtilities(float[] dest)
+        {
+            _lens.RefreshView(_utilityView, _store);
+            return _utilityView.CopyFloats(dest);
+        }
+
+        /// <summary>
+        /// Bulk-copy the per-actor Eligible column (1/0, as of the last <see cref="EvaluateEligibility"/> or
+        /// <see cref="EvaluateUtility"/>) into <paramref name="dest"/> in one parallel gather. View row i maps
+        /// to the i-th live actor (same ordering as <see cref="CopyUtilities"/>). Returns the count written.
+        /// </summary>
+        public int CopyEligibility(int[] dest)
+        {
+            _lens.RefreshView(_eligibleView, _store);
+            return _eligibleView.CopyInts(dest);
+        }
+
+        /// <summary>Map a row in the last <see cref="CopyUtilities"/>/<see cref="CopyEligibility"/> read-back back to its actor handle.</summary>
+        public int DecisionSourceActor(int viewRow) => (int)_utilityView.SourceRow((ulong)viewRow);
 
         /// <summary>
         /// Scan the Utility column and return the actor with the highest score (and its score), or
