@@ -36,7 +36,7 @@ namespace Heathen.HATE
         // Columns: Actor, Attr (which attribute), Magnitude (additive), EndTick, Active (1=live).
         private readonly DataStore _effects;
         private readonly int _effectsCapacity;
-        private const int FxActor = 0, FxAttr = 1, FxMagnitude = 2, FxEndTick = 3, FxActive = 4, FxGrantTags = 5;
+        private const int FxActor = 0, FxAttr = 1, FxMagnitude = 2, FxEndTick = 3, FxActive = 4, FxGrantTags = 5, FxGrantAbilities = 6;
         private const int EffectsStoreIndex = 1;
 
         private DataView _activeView;     // over the effects Active column, for reclaim read-back
@@ -81,6 +81,16 @@ namespace Heathen.HATE
         private const int TkActor = 0, TkFireTick = 1, TkEffectAttr = 2, TkEffectOp = 3, TkEffectMag = 4, TkCue = 5;
         private readonly System.Collections.Generic.List<CueEvent> _cues = new System.Collections.Generic.List<CueEvent>();
 
+        // ── Ability granting (§7 "AbilityInstances"). AbilityDefs are a compact catalogue (managed list,
+        //    indexed by ability id); which abilities each actor holds is a per-actor Int32 bitmask column
+        //    (bit k = catalogue[k] granted) — the hot, branchless, batch-testable "instance" record, max 32
+        //    distinct abilities per world (mirrors the 32 hot tags). Activation is gated on the grant. ──
+        private const int MaxAbilities = 32;
+        private readonly int _baseAbilitiesCol;    // Int32 bitmask: intrinsic grants (mirrors BaseTags)
+        private readonly int _grantedAbilitiesCol; // Int32 bitmask: effective = base OR active-effect grants (mirrors CurrentTags)
+        private readonly IrProgram _recomputeAbilities; // GrantedAbilities = BaseGrantedAbilities
+        private readonly System.Collections.Generic.List<AbilityDef> _abilityCatalogue = new System.Collections.Generic.List<AbilityDef>();
+
         /// <summary>Sentinel returned by <see cref="SpawnActor"/> when the world is at capacity.</summary>
         public const int InvalidActor = -1;
 
@@ -119,8 +129,9 @@ namespace Heathen.HATE
                 _tagIndex[tagNames[t]] = t;
 
             // Actor columns: [a0.Base, a0.Current, …] (Float) then BaseTags, CurrentTags, Selected,
-            // Eligible (Int32) and Utility (Float); then (when abilityScoreSlots>0) K Score columns
-            // (Float), Variance (Float), Command (Int32), Choice (Int32) and a WeightedSum scratch (Float).
+            // Eligible (Int32), Utility (Float), BaseAbilities + GrantedAbilities (Int32, intrinsic vs
+            // effective grants — mirrors BaseTags/CurrentTags); then (when abilityScoreSlots>0) K Score
+            // columns (Float), Variance (Float), Command (Int32), Choice (Int32), WeightedSum scratch (Float).
             _abilityScoreSlots = abilityScoreSlots;
             int attrCols = attributeNames.Length * 2;
             _baseTagsCol = attrCols;
@@ -128,8 +139,10 @@ namespace Heathen.HATE
             _selectedCol = attrCols + 2;
             _eligibleCol = attrCols + 3;
             _utilityCol = attrCols + 4;
+            _baseAbilitiesCol = attrCols + 5;
+            _grantedAbilitiesCol = attrCols + 6;
 
-            int colCount = attrCols + 5;
+            int colCount = attrCols + 7;
             if (abilityScoreSlots > 0)
             {
                 _scoreCol0 = colCount;
@@ -155,6 +168,8 @@ namespace Heathen.HATE
             colNames[_selectedCol] = "Selected";       colTypes[_selectedCol] = DataLensValueType.Int32;
             colNames[_eligibleCol] = "Eligible";       colTypes[_eligibleCol] = DataLensValueType.Int32;
             colNames[_utilityCol] = "Utility";         colTypes[_utilityCol] = DataLensValueType.Float;
+            colNames[_baseAbilitiesCol] = "BaseAbilities";       colTypes[_baseAbilitiesCol] = DataLensValueType.Int32;
+            colNames[_grantedAbilitiesCol] = "GrantedAbilities"; colTypes[_grantedAbilitiesCol] = DataLensValueType.Int32;
             if (abilityScoreSlots > 0)
             {
                 for (int s = 0; s < abilityScoreSlots; s++)
@@ -176,9 +191,10 @@ namespace Heathen.HATE
             // Active-effects store: a row per live duration effect (no heap object — the §5.2 win).
             _effectsCapacity = capacity * 4; // a few effects per actor; fixed, recycled on expiry
             _effects = new DataStore(
-                new[] { "Actor", "Attr", "Magnitude", "EndTick", "Active", "GrantTags" },
+                new[] { "Actor", "Attr", "Magnitude", "EndTick", "Active", "GrantTags", "GrantAbilities" },
                 new[] { DataLensValueType.Int32, DataLensValueType.Int32, DataLensValueType.Float,
-                        DataLensValueType.Int32, DataLensValueType.Int32, DataLensValueType.Int32 },
+                        DataLensValueType.Int32, DataLensValueType.Int32, DataLensValueType.Int32,
+                        DataLensValueType.Int32 },
                 (ulong)_effectsCapacity);
 
             _table = new[] { _store, _effects };
@@ -212,6 +228,10 @@ namespace Heathen.HATE
             // Reusable: CurrentTags = BaseTags (granted tags are OR'd on top, host-side, per recompute).
             _recomputeTags = new IrProgram();
             _recomputeTags.Add(IrOp.IntColumn(0, _currentTagsCol, SystemOp.Set, _baseTagsCol));
+
+            // Reusable: GrantedAbilities = BaseAbilities (effect-granted abilities OR'd on top per recompute).
+            _recomputeAbilities = new IrProgram();
+            _recomputeAbilities.Add(IrOp.IntColumn(0, _grantedAbilitiesCol, SystemOp.Set, _baseAbilitiesCol));
         }
 
         public int AttributeCount => _attrNames.Length;
@@ -230,9 +250,12 @@ namespace Heathen.HATE
         {
             ulong row = _store.AllocRow();
             if (row == DataStore.InvalidRow) return InvalidActor;
+            // Reused slots must not inherit a previous occupant's grants (intrinsic or effective).
+            _store.SetInt(row, (ulong)_baseAbilitiesCol, 0);
+            _store.SetInt(row, (ulong)_grantedAbilitiesCol, 0);
             if (_abilityScoreSlots > 0)
             {
-                // Reused slots must not inherit a previous occupant's command/variance/choice.
+                // …or its command/variance/choice.
                 _store.SetInt(row, (ulong)_commandCol, -1);
                 _store.SetInt(row, (ulong)_choiceCol, -1);
                 _store.SetFloat(row, (ulong)_varianceCol, 0f);
@@ -311,6 +334,15 @@ namespace Heathen.HATE
         /// the effect expires. The status-effect backbone (e.g. a stun debuff grants `State.Stunned`).
         /// </summary>
         public int ApplyDuration(int actor, int attr, float magnitude, int durationTicks, int grantTags)
+            => ApplyDuration(actor, attr, magnitude, durationTicks, grantTags, 0);
+
+        /// <summary>
+        /// As <see cref="ApplyDuration(int,int,float,int,int)"/> but the effect also GRANTS the given
+        /// ability mask (§7 effect-driven granting) for its lifetime — OR'd into GrantedAbilities by
+        /// <see cref="RecomputeAbilities"/>, dropped when the effect expires. Use <see cref="GrantAbilityFor"/>
+        /// for the common "grant one ability for N ticks" case.
+        /// </summary>
+        public int ApplyDuration(int actor, int attr, float magnitude, int durationTicks, int grantTags, int grantAbilities)
         {
             ulong r = _effects.AllocRow();
             if (r == DataStore.InvalidRow) return InvalidEffect;
@@ -320,6 +352,7 @@ namespace Heathen.HATE
             _effects.SetInt(r, (ulong)FxEndTick, _currentTick + durationTicks);
             _effects.SetInt(r, (ulong)FxActive, 1);
             _effects.SetInt(r, (ulong)FxGrantTags, grantTags);
+            _effects.SetInt(r, (ulong)FxGrantAbilities, grantAbilities);
             return (int)r;
         }
 
@@ -487,12 +520,156 @@ namespace Heathen.HATE
             => (int)_lens.RunFloatWhereInt(_store, (ulong)BaseCol(attr), ToSystemOp(op), magnitude,
                 (ulong)_currentTagsCol, CompareFor(trigger.Mode), trigger.Mask);
 
+        // ── Ability granting (§7 "AbilityInstances") ─────────────────────────
+        // AbilityDefs are a compact catalogue; which abilities an actor holds is a per-actor bitmask.
+        // Only granted abilities can be activated by id (parity with UE GiveAbility / FGameplayAbilitySpec).
+
+        /// <summary>Number of abilities registered in the catalogue.</summary>
+        public int AbilityCount => _abilityCatalogue.Count;
+
+        /// <summary>
+        /// Register an ability definition in the world's catalogue and return its <b>ability id</b> (0-based,
+        /// max 32). The id is the bit used by <see cref="GrantAbility"/> and the handle for the id-based
+        /// <see cref="CanActivate(int,int)"/>/<see cref="TryActivate(int,int)"/>. Definitions are shared data;
+        /// per-actor state lives in the grant bitmask (and the existing cooldown tags / effect rows).
+        /// </summary>
+        public int RegisterAbility(in AbilityDef ability)
+        {
+            if (_abilityCatalogue.Count >= MaxAbilities)
+                throw new InvalidOperationException($"At most {MaxAbilities} abilities per world (Int32 grant bitmask).");
+            _abilityCatalogue.Add(ability);
+            return _abilityCatalogue.Count - 1;
+        }
+
+        /// <summary>The registered definition for an ability id.</summary>
+        public AbilityDef GetAbility(int abilityId)
+        {
+            if ((uint)abilityId >= (uint)_abilityCatalogue.Count)
+                throw new ArgumentOutOfRangeException(nameof(abilityId));
+            return _abilityCatalogue[abilityId];
+        }
+
+        private int AbilityBit(int abilityId)
+        {
+            if ((uint)abilityId >= (uint)_abilityCatalogue.Count)
+                throw new ArgumentOutOfRangeException(nameof(abilityId));
+            return 1 << abilityId;
+        }
+
+        // Intrinsic grants live in BaseAbilities; the effective GrantedAbilities (read by HasAbility /
+        // activation / eligibility) is BaseAbilities OR active-effect grants, rebuilt by RecomputeAbilities.
+        // Direct grant/revoke writes BOTH so the change is usable the same frame without a recompute
+        // (mirrors the cooldown's immediate-reflect trick); RecomputeAbilities then keeps them consistent.
+
+        /// <summary>Grant an intrinsic ability to one actor (sets its base + effective grant bit). Idempotent.</summary>
+        public void GrantAbility(int actor, int abilityId)
+        {
+            int bit = AbilityBit(abilityId);
+            _store.TryGetInt((ulong)actor, (ulong)_baseAbilitiesCol, out int b);
+            _store.SetInt((ulong)actor, (ulong)_baseAbilitiesCol, b | bit);
+            _store.TryGetInt((ulong)actor, (ulong)_grantedAbilitiesCol, out int e);
+            _store.SetInt((ulong)actor, (ulong)_grantedAbilitiesCol, e | bit);
+        }
+
+        /// <summary>Revoke an intrinsic ability from one actor (clears its base + effective grant bit).
+        /// If an active effect still grants it, the next <see cref="RecomputeAbilities"/> restores it.</summary>
+        public void RevokeAbility(int actor, int abilityId)
+        {
+            int bit = AbilityBit(abilityId);
+            _store.TryGetInt((ulong)actor, (ulong)_baseAbilitiesCol, out int b);
+            _store.SetInt((ulong)actor, (ulong)_baseAbilitiesCol, b & ~bit);
+            _store.TryGetInt((ulong)actor, (ulong)_grantedAbilitiesCol, out int e);
+            _store.SetInt((ulong)actor, (ulong)_grantedAbilitiesCol, e & ~bit);
+        }
+
+        /// <summary>Revoke every intrinsic ability from one actor (effect grants reappear on recompute).</summary>
+        public void RevokeAllAbilities(int actor)
+        {
+            _store.SetInt((ulong)actor, (ulong)_baseAbilitiesCol, 0);
+            _store.SetInt((ulong)actor, (ulong)_grantedAbilitiesCol, 0);
+        }
+
+        /// <summary>Grant an ability to every live actor in one pass (e.g. a class/role's kit). Parallel.</summary>
+        public ulong GrantAbilityAll(int abilityId)
+        {
+            int bit = AbilityBit(abilityId);
+            _lens.RunInt(_store, (ulong)_baseAbilitiesCol, SystemOp.Or, bit);
+            return _lens.RunInt(_store, (ulong)_grantedAbilitiesCol, SystemOp.Or, bit);
+        }
+
+        /// <summary>Revoke an ability from every live actor in one pass. Parallel.</summary>
+        public ulong RevokeAbilityAll(int abilityId)
+        {
+            int bit = AbilityBit(abilityId);
+            _lens.RunInt(_store, (ulong)_baseAbilitiesCol, SystemOp.AndNot, bit);
+            return _lens.RunInt(_store, (ulong)_grantedAbilitiesCol, SystemOp.AndNot, bit);
+        }
+
+        /// <summary>True if the actor currently holds the ability (its effective grant bit is set).</summary>
+        public bool HasAbility(int actor, int abilityId)
+        {
+            _store.TryGetInt((ulong)actor, (ulong)_grantedAbilitiesCol, out int cur);
+            return (cur & AbilityBit(abilityId)) != 0;
+        }
+
+        /// <summary>The actor's full effective granted-ability bitmask (intrinsic + effect-granted).</summary>
+        public int GetGrantedAbilities(int actor)
+        {
+            _store.TryGetInt((ulong)actor, (ulong)_grantedAbilitiesCol, out int cur);
+            return cur;
+        }
+
+        /// <summary>
+        /// Grant an ability to an actor for <paramref name="durationTicks"/> ticks via an auto-expiring
+        /// duration effect (§7 effect-driven granting, UE parity): a pure grant effect (no attribute change).
+        /// The grant appears in <see cref="GetGrantedAbilities"/> after the next <see cref="RecomputeAbilities"/>
+        /// and is dropped automatically when the effect expires (<see cref="ExpireEffects"/> + recompute).
+        /// Returns the effect handle, or <see cref="InvalidEffect"/> when the effects store is full.
+        /// </summary>
+        public int GrantAbilityFor(int actor, int abilityId, int durationTicks)
+            => ApplyDuration(actor, 0, 0f, durationTicks, 0, AbilityBit(abilityId));
+
+        /// <summary>
+        /// Derive GrantedAbilities = BaseAbilities (one parallel System), then OR in every active effect's
+        /// granted abilities (host-side scatter). Call after applying/expiring effects (alongside
+        /// <see cref="RecomputeTags"/>) to refresh effect-driven ability grants.
+        /// </summary>
+        public void RecomputeAbilities()
+        {
+            _lens.Execute(_recomputeAbilities, _table);
+            if (_effects.LiveCount == 0) return; // no granting effects: effective is just BaseAbilities
+            for (int r = 0; r < _effectsCapacity; r++)
+            {
+                if (!_effects.IsValid((ulong)r)) continue;
+                _effects.TryGetInt((ulong)r, (ulong)FxActive, out int active);
+                if (active == 0) continue;
+                _effects.TryGetInt((ulong)r, (ulong)FxGrantAbilities, out int grant);
+                if (grant == 0) continue;
+                _effects.TryGetInt((ulong)r, (ulong)FxActor, out int actor);
+                _store.TryGetInt((ulong)actor, (ulong)_grantedAbilitiesCol, out int cur);
+                _store.SetInt((ulong)actor, (ulong)_grantedAbilitiesCol, cur | grant);
+            }
+        }
+
         // ── Abilities (§7): activation pipeline (cost + cooldown + requirement) ──
+
+        /// <summary>
+        /// Id-based <see cref="CanActivate(int,in AbilityDef)"/>: also requires the actor to have been
+        /// GRANTED the ability (§7). Use this once abilities are registered + granted; the AbilityDef
+        /// overload is the ungated primitive.
+        /// </summary>
+        public bool CanActivate(int actor, int abilityId)
+            => HasAbility(actor, abilityId) && CanActivate(actor, GetAbility(abilityId));
+
+        /// <summary>Id-based <see cref="TryActivate(int,in AbilityDef)"/>: no-op unless the ability is granted.</summary>
+        public bool TryActivate(int actor, int abilityId)
+            => HasAbility(actor, abilityId) && TryActivate(actor, GetAbility(abilityId));
 
         /// <summary>
         /// CanActivate (§7): true if the ability's cost is affordable, its cooldown is ready (the actor
         /// lacks the cooldown tag), and its activation requirement (if any) passes against the actor's
-        /// CurrentTags. Reads tags as of the last <see cref="RecomputeTags"/>.
+        /// CurrentTags. Reads tags as of the last <see cref="RecomputeTags"/>. This overload does NOT check
+        /// granting — use <see cref="CanActivate(int,int)"/> to gate on the grant.
         /// </summary>
         public bool CanActivate(int actor, in AbilityDef ability)
         {
@@ -604,13 +781,26 @@ namespace Heathen.HATE
         // ── Mass AI: batch CanActivate (§7) + utility weights (§8) ───────────
 
         /// <summary>
+        /// Grant-gated batch eligibility (§7): the id-based <see cref="EvaluateEligibility(in AbilityDef)"/>
+        /// that ALSO knocks out, in one branchless pass, every actor that has not been granted the ability.
+        /// </summary>
+        public void EvaluateEligibility(int abilityId)
+        {
+            EvaluateEligibility(GetAbility(abilityId));
+            // Eligible = 0 where the actor lacks the grant bit.
+            _lens.RunInt(_store, (ulong)_eligibleCol, SystemOp.Set, 0,
+                (ulong)_grantedAbilitiesCol, CompareOp.LacksBits, AbilityBit(abilityId));
+        }
+
+        /// <summary>
         /// Compute, for EVERY live actor, whether it could activate the ability right now — into the
         /// per-actor Eligible column (1/0), as a few branchless column passes (the batch form of
         /// <see cref="CanActivate"/> for mass AI). Eligible starts true and is knocked out by: cost
         /// unaffordable (Base &lt; cost, a float-predicate pass), on cooldown (HasAny cooldown tag), and
         /// the activation requirement failing. Reads tags as of the last <see cref="RecomputeTags"/>.
         /// (Batch requirement supports RequireAny/Exclude; multi-bit RequireAll is not expressible as a
-        /// single knock-out — use single-bit masks or per-actor CanActivate.)
+        /// single knock-out — use single-bit masks or per-actor CanActivate.) This overload does NOT gate
+        /// on granting — use <see cref="EvaluateEligibility(int)"/> for that.
         /// </summary>
         public void EvaluateEligibility(in AbilityDef ability)
         {
@@ -657,6 +847,19 @@ namespace Heathen.HATE
         public int CountEligible(in AbilityDef ability)
         {
             EvaluateEligibility(ability);
+            return CountEligibleColumn();
+        }
+
+        /// <summary>Grant-gated <see cref="CountEligible(in AbilityDef)"/>: how many live actors are both
+        /// granted the ability and pass its limiters.</summary>
+        public int CountEligible(int abilityId)
+        {
+            EvaluateEligibility(abilityId);
+            return CountEligibleColumn();
+        }
+
+        private int CountEligibleColumn()
+        {
             _lens.RefreshView(_eligibleView, _store);
             int n = _eligibleView.CopyInts(_eligibleScratch);
             int count = 0;
@@ -975,6 +1178,7 @@ namespace Heathen.HATE
             _choiceView?.Dispose();
             _recomputeCurrent?.Dispose();
             _recomputeTags?.Dispose();
+            _recomputeAbilities?.Dispose();
             _lens?.Dispose();
             _effects?.Dispose();
             _tasks?.Dispose();
