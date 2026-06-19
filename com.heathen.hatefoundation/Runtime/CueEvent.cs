@@ -1,20 +1,22 @@
+using Heathen.GameplayTags;
+
 namespace Heathen.HATE
 {
     /// <summary>
     /// A cosmetic cue event (HATE-Spec §9): a fire-and-forget signal for presentation (VFX/SFX/UI) to
     /// play. Cues are NEVER simulation state — they are an append-only output stream drained by the
-    /// host each frame, so they never affect determinism. <see cref="CueId"/> is a host-defined id
-    /// (e.g. a tag or enum); <see cref="Magnitude"/> carries an optional scalar (damage dealt, etc.).
+    /// host each frame, so they never affect determinism. <see cref="Cue"/> is a GameplayTag identity
+    /// (e.g. <c>Cues.Fireball</c>); <see cref="Magnitude"/> carries an optional scalar (damage dealt, etc.).
     /// </summary>
     public readonly struct CueEvent
     {
-        public readonly int CueId;
-        public readonly int Actor;
+        public readonly GameplayTag Cue;
+        public readonly ulong Actor;
         public readonly float Magnitude;
 
-        public CueEvent(int cueId, int actor, float magnitude)
+        public CueEvent(GameplayTag cue, ulong actor, float magnitude)
         {
-            CueId = cueId;
+            Cue = cue;
             Actor = actor;
             Magnitude = magnitude;
         }

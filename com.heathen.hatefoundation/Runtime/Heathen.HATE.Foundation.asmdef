@@ -2,7 +2,8 @@
     "name": "Heathen.HATE.Foundation",
     "rootNamespace": "Heathen.HATE",
     "references": [
-        "Heathen.DataLens.Foundation"
+        "Heathen.DataLens.Foundation",
+        "Heathen.GameplayTags"
     ],
     "includePlatforms": [],
     "excludePlatforms": [],
@@ -12,5 +13,5 @@
     "autoReferenced": true,
     "defineConstraints": [],
     "versionDefines": [],
-    "noEngineReferences": true
+    "noEngineReferences": false
 }

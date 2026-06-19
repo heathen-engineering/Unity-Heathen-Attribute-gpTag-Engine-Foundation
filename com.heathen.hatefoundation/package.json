@@ -10,7 +10,8 @@
     "url": "https://heathen.group"
   },
   "dependencies": {
-    "com.heathen.datalensfoundation": "0.1.0"
+    "com.heathen.datalensfoundation": "0.1.0",
+    "com.heathen.gameplaytags": "1.0.10"
   },
   "keywords": [
     "hate",

@@ -1,4 +1,5 @@
 using Heathen.DataLens;
+using Heathen.GameplayTags;
 
 namespace Heathen.HATE
 {
@@ -32,14 +33,14 @@ namespace Heathen.HATE
     /// </summary>
     public struct Consideration
     {
-        /// <summary>The attribute whose Current value is the input metric.</summary>
-        public int MetricAttr;
+        /// <summary>The attribute (by GameplayTag identity) whose Current value is the input metric.</summary>
+        public GameplayTag MetricAttr;
         /// <summary>The response curve (includes its own normalise range [Min,Max] and invert flag).</summary>
         public Curve Curve;
         /// <summary>Weight for <see cref="Aggregate.WeightedSum"/> (ignored under <see cref="Aggregate.Product"/>).</summary>
         public float Weight;
 
-        public Consideration(int metricAttr, Curve curve, float weight = 1f)
+        public Consideration(GameplayTag metricAttr, Curve curve, float weight = 1f)
         {
             MetricAttr = metricAttr;
             Curve = curve;
