@@ -36,7 +36,7 @@ namespace Heathen.HATE
         // Columns: Actor, Attr (which attribute), Magnitude (additive), EndTick, Active (1=live).
         private readonly DataStore _effects;
         private readonly int _effectsCapacity;
-        private const int FxActor = 0, FxAttr = 1, FxMagnitude = 2, FxEndTick = 3, FxActive = 4, FxGrantTags = 5, FxGrantAbilities = 6;
+        private const int FxActor = 0, FxAttr = 1, FxMagnitude = 2, FxEndTick = 3, FxActive = 4, FxGrantTags = 5, FxGrantAbilities = 6, FxOp = 7, FxEffectId = 8, FxStackCount = 9, FxGrantImmunity = 10, FxReqMask = 11, FxReqMode = 12, FxSuspended = 13;
         private const int EffectsStoreIndex = 1;
 
         private DataView _activeView;     // over the effects Active column, for reclaim read-back
@@ -47,6 +47,7 @@ namespace Heathen.HATE
         // ── Tags (§5.5 granted tags / §6 Trigger gating). Up to 32 "hot" tags packed as bits in an
         //    Int32 mask column, so a Trigger is a branchless DataLens bitmask predicate over all actors. ──
         private readonly Dictionary<string, int> _tagIndex;       // tag name -> bit index (0..31)
+        private readonly string[] _tagNames;                      // bit index -> tag name (for inspection/tooling)
         private readonly int _baseTagsCol, _currentTagsCol, _selectedCol; // Int32 columns on the actor store
         private readonly IrProgram _recomputeTags;                // CurrentTags = BaseTags
         private DataView _selectedView;                           // over the actor Selected column
@@ -91,6 +92,13 @@ namespace Heathen.HATE
         private readonly IrProgram _recomputeAbilities; // GrantedAbilities = BaseGrantedAbilities
         private readonly System.Collections.Generic.List<AbilityDef> _abilityCatalogue = new System.Collections.Generic.List<AbilityDef>();
 
+        // ── Immunity (§5.5). Per-actor immunity mask (over the same hot-tag bits): an incoming effect's
+        //    asset tags matching it are blocked. Base (intrinsic) + effective (base OR active-effect grants),
+        //    like tags/abilities; effects confer immunity for their lifetime via FxGrantImmunity. ──
+        private readonly int _baseImmunityCol;     // Int32 bitmask: intrinsic immunity
+        private readonly int _immunityCol;         // Int32 bitmask: effective = base OR active-effect grants
+        private readonly IrProgram _recomputeImmunity; // Immunity = BaseImmunity
+
         /// <summary>Sentinel returned by <see cref="SpawnActor"/> when the world is at capacity.</summary>
         public const int InvalidActor = -1;
 
@@ -123,6 +131,7 @@ namespace Heathen.HATE
                 throw new ArgumentException("abilityScoreSlots must be in 0..64.", nameof(abilityScoreSlots));
 
             _attrNames = (string[])attributeNames.Clone();
+            _tagNames = (string[])tagNames.Clone();
             _attrIndex = new Dictionary<string, int>(attributeNames.Length);
             _tagIndex = new Dictionary<string, int>(tagNames.Length);
             for (int t = 0; t < tagNames.Length; t++)
@@ -141,8 +150,10 @@ namespace Heathen.HATE
             _utilityCol = attrCols + 4;
             _baseAbilitiesCol = attrCols + 5;
             _grantedAbilitiesCol = attrCols + 6;
+            _baseImmunityCol = attrCols + 7;
+            _immunityCol = attrCols + 8;
 
-            int colCount = attrCols + 7;
+            int colCount = attrCols + 9;
             if (abilityScoreSlots > 0)
             {
                 _scoreCol0 = colCount;
@@ -170,6 +181,8 @@ namespace Heathen.HATE
             colNames[_utilityCol] = "Utility";         colTypes[_utilityCol] = DataLensValueType.Float;
             colNames[_baseAbilitiesCol] = "BaseAbilities";       colTypes[_baseAbilitiesCol] = DataLensValueType.Int32;
             colNames[_grantedAbilitiesCol] = "GrantedAbilities"; colTypes[_grantedAbilitiesCol] = DataLensValueType.Int32;
+            colNames[_baseImmunityCol] = "BaseImmunity";         colTypes[_baseImmunityCol] = DataLensValueType.Int32;
+            colNames[_immunityCol] = "Immunity";                 colTypes[_immunityCol] = DataLensValueType.Int32;
             if (abilityScoreSlots > 0)
             {
                 for (int s = 0; s < abilityScoreSlots; s++)
@@ -191,10 +204,12 @@ namespace Heathen.HATE
             // Active-effects store: a row per live duration effect (no heap object — the §5.2 win).
             _effectsCapacity = capacity * 4; // a few effects per actor; fixed, recycled on expiry
             _effects = new DataStore(
-                new[] { "Actor", "Attr", "Magnitude", "EndTick", "Active", "GrantTags", "GrantAbilities" },
+                new[] { "Actor", "Attr", "Magnitude", "EndTick", "Active", "GrantTags", "GrantAbilities", "Op", "EffectId", "StackCount", "GrantImmunity", "ReqMask", "ReqMode", "Suspended" },
                 new[] { DataLensValueType.Int32, DataLensValueType.Int32, DataLensValueType.Float,
                         DataLensValueType.Int32, DataLensValueType.Int32, DataLensValueType.Int32,
-                        DataLensValueType.Int32 },
+                        DataLensValueType.Int32, DataLensValueType.Int32, DataLensValueType.Int32,
+                        DataLensValueType.Int32, DataLensValueType.Int32, DataLensValueType.Int32,
+                        DataLensValueType.Int32, DataLensValueType.Int32 },
                 (ulong)_effectsCapacity);
 
             _table = new[] { _store, _effects };
@@ -232,6 +247,10 @@ namespace Heathen.HATE
             // Reusable: GrantedAbilities = BaseAbilities (effect-granted abilities OR'd on top per recompute).
             _recomputeAbilities = new IrProgram();
             _recomputeAbilities.Add(IrOp.IntColumn(0, _grantedAbilitiesCol, SystemOp.Set, _baseAbilitiesCol));
+
+            // Reusable: Immunity = BaseImmunity (effect-granted immunity OR'd on top per recompute).
+            _recomputeImmunity = new IrProgram();
+            _recomputeImmunity.Add(IrOp.IntColumn(0, _immunityCol, SystemOp.Set, _baseImmunityCol));
         }
 
         public int AttributeCount => _attrNames.Length;
@@ -253,6 +272,8 @@ namespace Heathen.HATE
             // Reused slots must not inherit a previous occupant's grants (intrinsic or effective).
             _store.SetInt(row, (ulong)_baseAbilitiesCol, 0);
             _store.SetInt(row, (ulong)_grantedAbilitiesCol, 0);
+            _store.SetInt(row, (ulong)_baseImmunityCol, 0);
+            _store.SetInt(row, (ulong)_immunityCol, 0);
             if (_abilityScoreSlots > 0)
             {
                 // …or its command/variance/choice.
@@ -343,6 +364,30 @@ namespace Heathen.HATE
         /// for the common "grant one ability for N ticks" case.
         /// </summary>
         public int ApplyDuration(int actor, int attr, float magnitude, int durationTicks, int grantTags, int grantAbilities)
+            => ApplyDurationCore(actor, attr, ModifierOp.Add, magnitude, durationTicks, grantTags, grantAbilities);
+
+        /// <summary>
+        /// Apply a duration effect on a specific aggregation channel (§5.3): <see cref="ModifierOp.Add"/>
+        /// (Current += Σmag), <see cref="ModifierOp.Multiply"/> (Current ·= Πmag), or
+        /// <see cref="ModifierOp.Override"/> (Current = mag, applied last). Channels are combined by
+        /// <see cref="RecomputeCurrent"/> as <c>Current = override ?? (Base + ΣAdd)·ΠMul</c>. Returns the
+        /// effect handle, or <see cref="InvalidEffect"/> when the store is full.
+        /// </summary>
+        public int ApplyDuration(int actor, int attr, ModifierOp op, float magnitude, int durationTicks)
+            => ApplyDurationCore(actor, attr, op, magnitude, durationTicks, 0, 0);
+
+        /// <summary>
+        /// Apply a duration effect with an ONGOING requirement (§5.5): each step <see cref="RecomputeSuspension"/>
+        /// tests <paramref name="ongoingRequirement"/> against the actor's CurrentTags; while it fails the
+        /// effect is SUSPENDED (its modifiers, granted tags/abilities/immunity stop applying) but is NOT
+        /// removed — it resumes when the condition returns, and still expires on its EndTick. Returns the
+        /// effect handle.
+        /// </summary>
+        public int ApplyDuration(int actor, int attr, ModifierOp op, float magnitude, int durationTicks, TagTrigger ongoingRequirement)
+            => ApplyDurationCore(actor, attr, op, magnitude, durationTicks, 0, 0, 0, ongoingRequirement.Mask, (int)ongoingRequirement.Mode);
+
+        private int ApplyDurationCore(int actor, int attr, ModifierOp op, float magnitude, int durationTicks,
+            int grantTags, int grantAbilities, int grantImmunity = 0, int reqMask = 0, int reqMode = -1)
         {
             ulong r = _effects.AllocRow();
             if (r == DataStore.InvalidRow) return InvalidEffect;
@@ -353,7 +398,94 @@ namespace Heathen.HATE
             _effects.SetInt(r, (ulong)FxActive, 1);
             _effects.SetInt(r, (ulong)FxGrantTags, grantTags);
             _effects.SetInt(r, (ulong)FxGrantAbilities, grantAbilities);
+            _effects.SetInt(r, (ulong)FxOp, (int)op);
+            _effects.SetInt(r, (ulong)FxEffectId, -1); // non-stacking
+            _effects.SetInt(r, (ulong)FxStackCount, 1);
+            _effects.SetInt(r, (ulong)FxGrantImmunity, grantImmunity);
+            _effects.SetInt(r, (ulong)FxReqMask, reqMask);
+            _effects.SetInt(r, (ulong)FxReqMode, reqMode);   // -1 = no ongoing requirement
+            _effects.SetInt(r, (ulong)FxSuspended, 0);
             return (int)r;
+        }
+
+        /// <summary>
+        /// Apply a STACKING duration effect (§5.5): effects sharing an <paramref name="effectId"/> on the
+        /// same actor collapse to one row carrying a <c>StackCount</c> instead of spawning a new row. A
+        /// re-application bumps the count (capped at <paramref name="stackLimit"/>) and applies the
+        /// <paramref name="refresh"/> policy to the remaining duration. The modifier's contribution scales
+        /// with the count: Add → count·mag, Multiply → mag^count, Override → mag. (Aggregate-by-target
+        /// stacking; per-source stacking is a later refinement.) Returns the stack's effect handle.
+        /// </summary>
+        public int ApplyStackingDuration(int actor, int attr, ModifierOp op, float magnitudePerStack,
+            int durationTicks, int effectId, int stackLimit, StackRefresh refresh = StackRefresh.RefreshDuration)
+        {
+            if (effectId < 0) // not actually stacking → an ordinary duration effect
+                return ApplyDurationCore(actor, attr, op, magnitudePerStack, durationTicks, 0, 0);
+
+            int cap = stackLimit < 1 ? 1 : stackLimit;
+            int existing = FindActiveStack(actor, effectId);
+            if (existing >= 0)
+            {
+                _effects.TryGetInt((ulong)existing, (ulong)FxStackCount, out int count);
+                count = count + 1 > cap ? cap : count + 1; // overflow: cap, still refresh below
+                _effects.SetInt((ulong)existing, (ulong)FxStackCount, count);
+
+                int newEnd = _currentTick + durationTicks;
+                if (refresh == StackRefresh.RefreshDuration)
+                {
+                    _effects.SetInt((ulong)existing, (ulong)FxEndTick, newEnd);
+                }
+                else if (refresh == StackRefresh.KeepLongest)
+                {
+                    _effects.TryGetInt((ulong)existing, (ulong)FxEndTick, out int curEnd);
+                    if (newEnd > curEnd) _effects.SetInt((ulong)existing, (ulong)FxEndTick, newEnd);
+                }
+                // KeepExisting: leave EndTick untouched.
+                return existing;
+            }
+
+            // First stack: a fresh row with StackCount 1.
+            ulong r = _effects.AllocRow();
+            if (r == DataStore.InvalidRow) return InvalidEffect;
+            _effects.SetInt(r, (ulong)FxActor, actor);
+            _effects.SetInt(r, (ulong)FxAttr, attr);
+            _effects.SetFloat(r, (ulong)FxMagnitude, magnitudePerStack);
+            _effects.SetInt(r, (ulong)FxEndTick, _currentTick + durationTicks);
+            _effects.SetInt(r, (ulong)FxActive, 1);
+            _effects.SetInt(r, (ulong)FxGrantTags, 0);
+            _effects.SetInt(r, (ulong)FxGrantAbilities, 0);
+            _effects.SetInt(r, (ulong)FxOp, (int)op);
+            _effects.SetInt(r, (ulong)FxEffectId, effectId);
+            _effects.SetInt(r, (ulong)FxStackCount, 1);
+            _effects.SetInt(r, (ulong)FxGrantImmunity, 0);
+            _effects.SetInt(r, (ulong)FxReqMask, 0);
+            _effects.SetInt(r, (ulong)FxReqMode, -1);
+            _effects.SetInt(r, (ulong)FxSuspended, 0);
+            return (int)r;
+        }
+
+        /// <summary>The current stack count of an effect row (1 for a non-stacking effect).</summary>
+        public int GetStackCount(int effectHandle)
+        {
+            _effects.TryGetInt((ulong)effectHandle, (ulong)FxStackCount, out int c);
+            return c;
+        }
+
+        // Find an active stacking row for (actor, effectId), or -1. Scans active rows (bounded by live
+        // effect count); a (actor,effectId)->row index could replace this if stacking churn ever shows up.
+        private int FindActiveStack(int actor, int effectId)
+        {
+            for (int r = 0; r < _effectsCapacity; r++)
+            {
+                if (!_effects.IsValid((ulong)r)) continue;
+                _effects.TryGetInt((ulong)r, (ulong)FxActive, out int active);
+                if (active == 0) continue;
+                _effects.TryGetInt((ulong)r, (ulong)FxEffectId, out int id);
+                if (id != effectId) continue;
+                _effects.TryGetInt((ulong)r, (ulong)FxActor, out int a);
+                if (a == actor) return r;
+            }
+            return -1;
         }
 
         /// <summary>
@@ -390,10 +522,10 @@ namespace Heathen.HATE
         }
 
         /// <summary>
-        /// Derive Current from Base for every attribute, then add every active duration effect's
-        /// magnitude onto its target attribute's Current (§5.3, additive modifiers). The Current=Base
-        /// pass is one parallel System; the modifier accumulation is host-side for now (a scatter the
-        /// substrate doesn't yet express as a System — future work).
+        /// Derive Current from Base for every attribute (one parallel System), then fold in every active
+        /// duration effect by aggregation channel (§5.3): <c>Current = override ?? (Base + ΣAdd)·ΠMul</c>.
+        /// The Current=Base pass is parallel; the per-channel accumulation is host-side over the ACTIVE
+        /// effects (cost ∝ live effects, not actor count — moving it to a dirty-driven System is future work).
         /// </summary>
         public void RecomputeCurrent()
         {
@@ -401,20 +533,51 @@ namespace Heathen.HATE
             AddActiveModifiers();
         }
 
+        // Per-(actor,attr) modifier channels, reused across RecomputeCurrent calls (cleared each time).
+        private struct ModChannels { public float SumAdd; public float ProdMul; public bool HasOverride; public float OverrideValue; }
+        private readonly Dictionary<long, ModChannels> _modAccum = new Dictionary<long, ModChannels>();
+        private static long ModKey(int actor, int attr) => ((long)actor << 32) | (uint)attr;
+
         private void AddActiveModifiers()
         {
             if (_effects.LiveCount == 0) return; // no active duration effects: Current is just Base
+            _modAccum.Clear();
+
+            // Pass 1: accumulate each active effect into its (actor,attr) channels.
             for (int r = 0; r < _effectsCapacity; r++)
             {
                 if (!_effects.IsValid((ulong)r)) continue;
                 _effects.TryGetInt((ulong)r, (ulong)FxActive, out int active);
                 if (active == 0) continue;
+                _effects.TryGetInt((ulong)r, (ulong)FxSuspended, out int suspended);
+                if (suspended != 0) continue; // a failing ongoing requirement (§5.5) — contributes nothing
                 _effects.TryGetInt((ulong)r, (ulong)FxActor, out int actor);
                 _effects.TryGetInt((ulong)r, (ulong)FxAttr, out int attr);
                 _effects.TryGetFloat((ulong)r, (ulong)FxMagnitude, out float mag);
+                _effects.TryGetInt((ulong)r, (ulong)FxOp, out int opCode);
+                _effects.TryGetInt((ulong)r, (ulong)FxStackCount, out int count);
+                if (count < 1) count = 1; // stacks scale the contribution (§5.5)
 
-                float cur = GetCurrent(actor, attr);
-                _store.SetFloat((ulong)actor, (ulong)CurrentCol(attr), cur + mag);
+                long key = ModKey(actor, attr);
+                if (!_modAccum.TryGetValue(key, out var ch)) ch = new ModChannels { ProdMul = 1f };
+                switch ((ModifierOp)opCode)
+                {
+                    case ModifierOp.Add:      ch.SumAdd += mag * count; break;            // count·mag
+                    case ModifierOp.Multiply: for (int s = 0; s < count; s++) ch.ProdMul *= mag; break; // mag^count
+                    case ModifierOp.Override: ch.HasOverride = true; ch.OverrideValue = mag; break;     // last write in scan wins
+                }
+                _modAccum[key] = ch;
+            }
+
+            // Pass 2: Current = override ?? (Base + ΣAdd)·ΠMul, once per touched (actor,attr).
+            foreach (var kv in _modAccum)
+            {
+                int actor = (int)(kv.Key >> 32);
+                int attr = (int)(kv.Key & 0xffffffff);
+                var ch = kv.Value;
+                float baseV = GetBase(actor, attr);
+                float cur = ch.HasOverride ? ch.OverrideValue : (baseV + ch.SumAdd) * ch.ProdMul;
+                _store.SetFloat((ulong)actor, (ulong)CurrentCol(attr), cur);
             }
         }
 
@@ -474,6 +637,8 @@ namespace Heathen.HATE
                 if (!_effects.IsValid((ulong)r)) continue;
                 _effects.TryGetInt((ulong)r, (ulong)FxActive, out int active);
                 if (active == 0) continue;
+                _effects.TryGetInt((ulong)r, (ulong)FxSuspended, out int suspended);
+                if (suspended != 0) continue;
                 _effects.TryGetInt((ulong)r, (ulong)FxGrantTags, out int grant);
                 if (grant == 0) continue;
                 _effects.TryGetInt((ulong)r, (ulong)FxActor, out int actor);
@@ -643,12 +808,184 @@ namespace Heathen.HATE
                 if (!_effects.IsValid((ulong)r)) continue;
                 _effects.TryGetInt((ulong)r, (ulong)FxActive, out int active);
                 if (active == 0) continue;
+                _effects.TryGetInt((ulong)r, (ulong)FxSuspended, out int suspended);
+                if (suspended != 0) continue;
                 _effects.TryGetInt((ulong)r, (ulong)FxGrantAbilities, out int grant);
                 if (grant == 0) continue;
                 _effects.TryGetInt((ulong)r, (ulong)FxActor, out int actor);
                 _store.TryGetInt((ulong)actor, (ulong)_grantedAbilitiesCol, out int cur);
                 _store.SetInt((ulong)actor, (ulong)_grantedAbilitiesCol, cur | grant);
             }
+        }
+
+        // ── Immunity (§5.5) ──────────────────────────────────────────────────
+        // An actor's immunity mask (over the hot-tag bits) says which effect "asset tags" it is immune to.
+        // Applying an effect whose asset tags overlap the mask is blocked. Immunity is intrinsic (base) or
+        // conferred by an effect for its lifetime; effective = base OR active grants, via RecomputeImmunity.
+
+        /// <summary>Add intrinsic immunity bits to an actor (effective immediately + persists across recompute).</summary>
+        public void SetBaseImmunity(int actor, int immunityMask)
+        {
+            _store.TryGetInt((ulong)actor, (ulong)_baseImmunityCol, out int b);
+            _store.SetInt((ulong)actor, (ulong)_baseImmunityCol, b | immunityMask);
+            _store.TryGetInt((ulong)actor, (ulong)_immunityCol, out int e);
+            _store.SetInt((ulong)actor, (ulong)_immunityCol, e | immunityMask);
+        }
+
+        /// <summary>Remove intrinsic immunity bits (effect-conferred immunity reappears on recompute).</summary>
+        public void ClearBaseImmunity(int actor, int immunityMask)
+        {
+            _store.TryGetInt((ulong)actor, (ulong)_baseImmunityCol, out int b);
+            _store.SetInt((ulong)actor, (ulong)_baseImmunityCol, b & ~immunityMask);
+            _store.TryGetInt((ulong)actor, (ulong)_immunityCol, out int e);
+            _store.SetInt((ulong)actor, (ulong)_immunityCol, e & ~immunityMask);
+        }
+
+        /// <summary>The actor's effective immunity mask (intrinsic + effect-conferred, post-<see cref="RecomputeImmunity"/>).</summary>
+        public int GetImmunity(int actor)
+        {
+            _store.TryGetInt((ulong)actor, (ulong)_immunityCol, out int v);
+            return v;
+        }
+
+        /// <summary>True if any of <paramref name="assetTags"/> are in the actor's effective immunity mask.</summary>
+        public bool IsImmuneTo(int actor, int assetTags) => (GetImmunity(actor) & assetTags) != 0;
+
+        /// <summary>
+        /// Confer immunity to <paramref name="immunityMask"/> on an actor for <paramref name="durationTicks"/>
+        /// ticks via an auto-expiring duration effect (a "ward"). Folded into the effective immunity by the
+        /// next <see cref="RecomputeImmunity"/> and dropped when the effect expires.
+        /// </summary>
+        public int GrantImmunityFor(int actor, int immunityMask, int durationTicks)
+            => ApplyDurationCore(actor, 0, ModifierOp.Add, 0f, durationTicks, 0, 0, immunityMask);
+
+        /// <summary>
+        /// Derive Immunity = BaseImmunity (one parallel System), then OR in every active effect's conferred
+        /// immunity (host-side scatter). Call after applying/expiring effects to refresh ward-style immunity.
+        /// </summary>
+        public void RecomputeImmunity()
+        {
+            _lens.Execute(_recomputeImmunity, _table);
+            if (_effects.LiveCount == 0) return;
+            for (int r = 0; r < _effectsCapacity; r++)
+            {
+                if (!_effects.IsValid((ulong)r)) continue;
+                _effects.TryGetInt((ulong)r, (ulong)FxActive, out int active);
+                if (active == 0) continue;
+                _effects.TryGetInt((ulong)r, (ulong)FxSuspended, out int suspended);
+                if (suspended != 0) continue;
+                _effects.TryGetInt((ulong)r, (ulong)FxGrantImmunity, out int grant);
+                if (grant == 0) continue;
+                _effects.TryGetInt((ulong)r, (ulong)FxActor, out int actor);
+                _store.TryGetInt((ulong)actor, (ulong)_immunityCol, out int cur);
+                _store.SetInt((ulong)actor, (ulong)_immunityCol, cur | grant);
+            }
+        }
+
+        // ── Ongoing requirements: suspend, not remove (§5.5) ─────────────────
+
+        /// <summary>
+        /// Re-evaluate each active effect's ONGOING requirement against its actor's CurrentTags and set the
+        /// effect's Suspended flag (§5.5): a suspended effect stays in the store and keeps counting toward its
+        /// EndTick, but contributes nothing (modifiers, granted tags/abilities/immunity all skip it) until the
+        /// requirement passes again. Recommended step order: <see cref="RecomputeTags"/> →
+        /// <see cref="RecomputeSuspension"/> → <see cref="RecomputeCurrent"/>/<see cref="RecomputeAbilities"/>/
+        /// <see cref="RecomputeImmunity"/>. (Suspension reads CurrentTags as of the last <see cref="RecomputeTags"/>,
+        /// so an effect whose ongoing requirement depends on a tag IT itself grants resolves one step lagged.)
+        /// </summary>
+        public void RecomputeSuspension()
+        {
+            if (_effects.LiveCount == 0) return;
+            for (int r = 0; r < _effectsCapacity; r++)
+            {
+                if (!_effects.IsValid((ulong)r)) continue;
+                _effects.TryGetInt((ulong)r, (ulong)FxActive, out int active);
+                if (active == 0) continue;
+                _effects.TryGetInt((ulong)r, (ulong)FxReqMode, out int mode);
+                if (mode < 0) continue; // no ongoing requirement -> never suspended
+                _effects.TryGetInt((ulong)r, (ulong)FxReqMask, out int mask);
+                _effects.TryGetInt((ulong)r, (ulong)FxActor, out int actor);
+                bool met = MatchesTrigger(GetCurrentTags(actor), new TagTrigger(mask, (TriggerMode)mode));
+                _effects.SetInt((ulong)r, (ulong)FxSuspended, met ? 0 : 1);
+            }
+        }
+
+        /// <summary>True if the effect is currently suspended by a failing ongoing requirement (post-<see cref="RecomputeSuspension"/>).</summary>
+        public bool IsEffectSuspended(int effectHandle)
+        {
+            _effects.TryGetInt((ulong)effectHandle, (ulong)FxSuspended, out int s);
+            return s != 0;
+        }
+
+        /// <summary>
+        /// Apply an Instant effect UNLESS the actor is immune to <paramref name="assetTags"/> (§5.5). Returns
+        /// true if it applied; false if blocked (optionally emitting <paramref name="blockedCue"/>). Reads
+        /// immunity as of the last <see cref="RecomputeImmunity"/>.
+        /// </summary>
+        public bool TryApplyInstant(int actor, int attr, ModifierOp op, float magnitude, int assetTags, int blockedCue = -1)
+        {
+            if (IsImmuneTo(actor, assetTags))
+            {
+                if (blockedCue >= 0) EmitCue(blockedCue, actor, 0f);
+                return false;
+            }
+            ApplyInstant(actor, attr, op, magnitude);
+            return true;
+        }
+
+        /// <summary>
+        /// Apply a Duration effect UNLESS the actor is immune to <paramref name="assetTags"/> (§5.5). Returns
+        /// the effect handle, or <see cref="InvalidEffect"/> if blocked (optionally emitting a cue).
+        /// </summary>
+        public int TryApplyDuration(int actor, int attr, ModifierOp op, float magnitude, int durationTicks,
+            int assetTags, int blockedCue = -1)
+        {
+            if (IsImmuneTo(actor, assetTags))
+            {
+                if (blockedCue >= 0) EmitCue(blockedCue, actor, 0f);
+                return InvalidEffect;
+            }
+            return ApplyDuration(actor, attr, op, magnitude, durationTicks);
+        }
+
+        // ── Execution & magnitude calculations (§5.4) ────────────────────────
+        // The "escape to host" path: a magnitude or a whole multi-attribute interaction is computed by host
+        // code that captures source/target attributes, instead of a constant. (A DataLens IR expression-tree
+        // MMC — branchless, batchable — is future work, couples to the A4 read-side expression nodes.)
+
+        /// <summary>Computes an effect magnitude from captured source/target state (a Magnitude Calc, §5.4).
+        /// Evaluated at apply time = a snapshot. <paramref name="source"/> == <paramref name="target"/> for a self-effect.</summary>
+        public delegate float MagnitudeCalc(HateWorld world, int source, int target);
+
+        /// <summary>Custom multi-attribute logic over a source/target (an Execution Calc, §5.4): reads captured
+        /// attributes and writes back through the normal effect API (e.g. armour → mitigation → final damage → Health).</summary>
+        public delegate void ExecutionCalc(HateWorld world, int source, int target);
+
+        /// <summary>Apply an Instant whose magnitude is computed by <paramref name="calc"/> (snapshot of source/target at apply).</summary>
+        public void ApplyInstantCalc(int source, int target, int attr, ModifierOp op, MagnitudeCalc calc)
+        {
+            if (calc == null) throw new ArgumentNullException(nameof(calc));
+            ApplyInstant(target, attr, op, calc(this, source, target));
+        }
+
+        /// <summary>Apply a Duration whose magnitude is computed by <paramref name="calc"/> (snapshot at apply). Returns the effect handle.</summary>
+        public int ApplyDurationCalc(int source, int target, int attr, ModifierOp op, MagnitudeCalc calc, int durationTicks)
+        {
+            if (calc == null) throw new ArgumentNullException(nameof(calc));
+            return ApplyDuration(target, attr, op, calc(this, source, target), durationTicks);
+        }
+
+        /// <summary>
+        /// Run a custom Execution calc (§5.4): host code that reads captured source/target attributes and
+        /// applies the resulting changes via the normal effect API (Instants/Durations/cues). The canonical
+        /// example is a damage exec — armour → mitigation → final damage → Health — that the constant-modifier
+        /// channels can't express. Runs synchronously for the one interaction (execs touch the few actors a
+        /// gameplay event hits, not the whole population every frame).
+        /// </summary>
+        public void RunExecution(int source, int target, ExecutionCalc exec)
+        {
+            if (exec == null) throw new ArgumentNullException(nameof(exec));
+            exec(this, source, target);
         }
 
         // ── Abilities (§7): activation pipeline (cost + cooldown + requirement) ──
@@ -1169,6 +1506,77 @@ namespace Heathen.HATE
             }
         }
 
+        // ── Inspection / tooling (read-only) ─────────────────────────────────
+        // Read-only accessors the HATE Toolkit (and save/debug systems) use to render a world's state.
+
+        /// <summary>Attribute name for an index (the order passed to the constructor).</summary>
+        public string AttributeName(int attr) => _attrNames[attr];
+
+        /// <summary>All attribute names, in index order.</summary>
+        public System.Collections.Generic.IReadOnlyList<string> AttributeNames => _attrNames;
+
+        /// <summary>Tag name for a bit index (0..31), or null if that bit is unnamed.</summary>
+        public string TagName(int bitIndex) => (uint)bitIndex < (uint)_tagNames.Length ? _tagNames[bitIndex] : null;
+
+        /// <summary>All tag names, in bit-index order.</summary>
+        public System.Collections.Generic.IReadOnlyList<string> TagNames => _tagNames;
+
+        /// <summary>A read-only view of one active duration-effect row, for inspection/tooling.</summary>
+        public readonly struct EffectSnapshot
+        {
+            public readonly int Handle;        // effects-store row index
+            public readonly int Actor;
+            public readonly int Attr;
+            public readonly ModifierOp Op;
+            public readonly float Magnitude;
+            public readonly int EndTick;
+            public readonly int StackCount;
+            public readonly bool Suspended;
+            public readonly int GrantTags;
+            public readonly int GrantAbilities;
+            public readonly int GrantImmunity;
+            public readonly int EffectId;      // -1 = non-stacking
+
+            public EffectSnapshot(int handle, int actor, int attr, ModifierOp op, float magnitude, int endTick,
+                int stackCount, bool suspended, int grantTags, int grantAbilities, int grantImmunity, int effectId)
+            {
+                Handle = handle; Actor = actor; Attr = attr; Op = op; Magnitude = magnitude; EndTick = endTick;
+                StackCount = stackCount; Suspended = suspended; GrantTags = grantTags; GrantAbilities = grantAbilities;
+                GrantImmunity = grantImmunity; EffectId = effectId;
+            }
+        }
+
+        /// <summary>
+        /// Fill <paramref name="results"/> (cleared first) with a snapshot of every active duration effect,
+        /// optionally only those targeting <paramref name="actorFilter"/> (-1 = all). For tooling/debugging.
+        /// </summary>
+        public void GetActiveEffects(System.Collections.Generic.List<EffectSnapshot> results, int actorFilter = -1)
+        {
+            if (results == null) throw new ArgumentNullException(nameof(results));
+            results.Clear();
+            if (_effects.LiveCount == 0) return;
+            for (int r = 0; r < _effectsCapacity; r++)
+            {
+                if (!_effects.IsValid((ulong)r)) continue;
+                _effects.TryGetInt((ulong)r, (ulong)FxActive, out int active);
+                if (active == 0) continue;
+                _effects.TryGetInt((ulong)r, (ulong)FxActor, out int actor);
+                if (actorFilter >= 0 && actor != actorFilter) continue;
+                _effects.TryGetInt((ulong)r, (ulong)FxAttr, out int attr);
+                _effects.TryGetFloat((ulong)r, (ulong)FxMagnitude, out float mag);
+                _effects.TryGetInt((ulong)r, (ulong)FxEndTick, out int endTick);
+                _effects.TryGetInt((ulong)r, (ulong)FxOp, out int op);
+                _effects.TryGetInt((ulong)r, (ulong)FxStackCount, out int stacks);
+                _effects.TryGetInt((ulong)r, (ulong)FxSuspended, out int suspended);
+                _effects.TryGetInt((ulong)r, (ulong)FxGrantTags, out int grantTags);
+                _effects.TryGetInt((ulong)r, (ulong)FxGrantAbilities, out int grantAbilities);
+                _effects.TryGetInt((ulong)r, (ulong)FxGrantImmunity, out int grantImmunity);
+                _effects.TryGetInt((ulong)r, (ulong)FxEffectId, out int effectId);
+                results.Add(new EffectSnapshot(r, actor, attr, (ModifierOp)op, mag, endTick, stacks,
+                    suspended != 0, grantTags, grantAbilities, grantImmunity, effectId));
+            }
+        }
+
         public void Dispose()
         {
             _activeView?.Dispose();
@@ -1179,6 +1587,7 @@ namespace Heathen.HATE
             _recomputeCurrent?.Dispose();
             _recomputeTags?.Dispose();
             _recomputeAbilities?.Dispose();
+            _recomputeImmunity?.Dispose();
             _lens?.Dispose();
             _effects?.Dispose();
             _tasks?.Dispose();
