@@ -39,13 +39,14 @@ namespace Heathen.HATE
         private readonly HateAttribute[] _attributes;          // by attribute index
         private readonly Dictionary<ulong, int> _attrByTag;    // GameplayTag.Id -> attribute index
         private readonly int[] _attrCol0;                      // attribute index -> its Base column index
+        private readonly IrProgram _recomputeCaps;             // Min = MinBase, Max = MaxBase, per attribute
         private readonly IrProgram _recomputeCurrent;          // Current = Base (then clamp), per attribute
 
         // ── Active duration effects (HATE-Spec §5.2 — buff density: a row per active effect, no heap). ──
         // Columns: Actor, Attr (which attribute), Magnitude (additive), EndTick, Active (1=live).
         private readonly DataStore _effects;
         private readonly int _effectsCapacity;
-        private const int FxActor = 0, FxAttr = 1, FxMagnitude = 2, FxEndTick = 3, FxActive = 4, FxGrantTags = 5, FxGrantAbilities = 6, FxOp = 7, FxEffectId = 8, FxStackCount = 9, FxGrantImmunity = 10, FxReqMask = 11, FxReqMode = 12, FxSuspended = 13;
+        private const int FxActor = 0, FxAttr = 1, FxMagnitude = 2, FxEndTick = 3, FxActive = 4, FxGrantTags = 5, FxGrantAbilities = 6, FxOp = 7, FxEffectId = 8, FxStackCount = 9, FxGrantImmunity = 10, FxReqMask = 11, FxReqMode = 12, FxSuspended = 13, FxField = 14;
         private const int EffectsStoreIndex = 1;
 
         private DataView _activeView;     // over the effects Active column, for reclaim read-back
@@ -149,14 +150,16 @@ namespace Heathen.HATE
             for (int t = 0; t < statusTags.Length; t++)
                 _statusByTag[statusTags[t].Id] = t;
 
-            // Actor columns: each attribute occupies FOUR columns [Base, Current, Min, Max] at its storage
-            // width, laid out contiguously (a's Base at _attrCol0[a]); then BaseTags, CurrentTags, Selected,
+            // Actor columns: each attribute occupies SIX columns [Base, Current, Min, Max, MinBase, MaxBase]
+            // at its storage width, laid out contiguously (a's Base at _attrCol0[a]). Min/Max are the EFFECTIVE
+            // caps (recomputed each step from MinBase/MaxBase + active cap-buff effects, §5.3); MinBase/MaxBase
+            // are the persistent caps that SetMin/SetMax write. Then BaseTags, CurrentTags, Selected,
             // Eligible (Int32), Utility (Float), BaseAbilities + GrantedAbilities (Int32, intrinsic vs
             // effective grants); then (when abilityScoreSlots>0) K Score columns (Float), Variance (Float),
             // Command (Int32), Choice (Int32), WeightedSum scratch (Float).
             _abilityScoreSlots = abilityScoreSlots;
-            int attrCols = attributes.Length * 4;
-            for (int a = 0; a < attributes.Length; a++) _attrCol0[a] = a * 4;
+            int attrCols = attributes.Length * 6;
+            for (int a = 0; a < attributes.Length; a++) _attrCol0[a] = a * 6;
             _baseTagsCol = attrCols;
             _currentTagsCol = attrCols + 1;
             _selectedCol = attrCols + 2;
@@ -186,10 +189,12 @@ namespace Heathen.HATE
                 _attrByTag[attr.Tag.Id] = a;
                 string name = attr.Tag.Name ?? attr.Tag.Id.ToString("X16");
                 var st = attr.StorageType;
-                colNames[BaseCol(a)] = name + ".Base";       colTypes[BaseCol(a)] = st;
+                colNames[BaseCol(a)] = name + ".Base";        colTypes[BaseCol(a)] = st;
                 colNames[CurrentCol(a)] = name + ".Current";  colTypes[CurrentCol(a)] = st;
                 colNames[MinCol(a)] = name + ".Min";          colTypes[MinCol(a)] = st;
                 colNames[MaxCol(a)] = name + ".Max";          colTypes[MaxCol(a)] = st;
+                colNames[MinBaseCol(a)] = name + ".MinBase";  colTypes[MinBaseCol(a)] = st;
+                colNames[MaxBaseCol(a)] = name + ".MaxBase";  colTypes[MaxBaseCol(a)] = st;
             }
             colNames[_baseTagsCol] = "BaseTags";       colTypes[_baseTagsCol] = DataLensValueType.Int32;
             colNames[_currentTagsCol] = "CurrentTags"; colTypes[_currentTagsCol] = DataLensValueType.Int32;
@@ -221,12 +226,12 @@ namespace Heathen.HATE
             // Active-effects store: a row per live duration effect (no heap object — the §5.2 win).
             _effectsCapacity = capacity * 4; // a few effects per actor; fixed, recycled on expiry
             _effects = new DataStore(
-                new[] { "Actor", "Attr", "Magnitude", "EndTick", "Active", "GrantTags", "GrantAbilities", "Op", "EffectId", "StackCount", "GrantImmunity", "ReqMask", "ReqMode", "Suspended" },
+                new[] { "Actor", "Attr", "Magnitude", "EndTick", "Active", "GrantTags", "GrantAbilities", "Op", "EffectId", "StackCount", "GrantImmunity", "ReqMask", "ReqMode", "Suspended", "Field" },
                 new[] { DataLensValueType.Int32, DataLensValueType.Int32, DataLensValueType.Float,
                         DataLensValueType.Int32, DataLensValueType.Int32, DataLensValueType.Int32,
                         DataLensValueType.Int32, DataLensValueType.Int32, DataLensValueType.Int32,
                         DataLensValueType.Int32, DataLensValueType.Int32, DataLensValueType.Int32,
-                        DataLensValueType.Int32, DataLensValueType.Int32 },
+                        DataLensValueType.Int32, DataLensValueType.Int32, DataLensValueType.Int32 },
                 (ulong)_effectsCapacity);
 
             _table = new[] { _store, _effects };
@@ -252,10 +257,21 @@ namespace Heathen.HATE
                         DataLensValueType.Int32, DataLensValueType.Float, DataLensValueType.Double },
                 (ulong)_tasksCapacity);
 
+            // Reusable: reset the EFFECTIVE caps to their persistent base (Min = MinBase, Max = MaxBase) for
+            // every attribute, before active cap-buff effects (§5.3) fold on top host-side. One parallel pass.
+            _recomputeCaps = new IrProgram();
+            for (int a = 0; a < _attributes.Length; a++)
+            {
+                var st = _attributes[a].StorageType;
+                _recomputeCaps.Add(IrOp.TypedColumn(0, st, MinCol(a), SystemOp.Set, MinBaseCol(a)));
+                _recomputeCaps.Add(IrOp.TypedColumn(0, st, MaxCol(a), SystemOp.Set, MaxBaseCol(a)));
+            }
+
             // Reusable: Current = clamp(Base, Min, Max) for every attribute, in the attribute's storage type.
             // The three ops per attribute touch the same Current column so they run ordered (Set, then clamp
-            // to Max, then to Min); clamp is monotonic so it is correct in offset space too. Duration-effect
-            // modifier aggregation is layered on host-side in RecomputeCurrent (Step 3).
+            // to Max, then to Min); clamp is monotonic so it is correct in offset space too. Min/Max are the
+            // EFFECTIVE caps (already folded by RecomputeCurrent before this runs). Duration Current-channel
+            // aggregation is layered on host-side in RecomputeCurrent (Step 3).
             _recomputeCurrent = new IrProgram();
             for (int a = 0; a < _attributes.Length; a++)
             {
@@ -288,11 +304,13 @@ namespace Heathen.HATE
         /// <summary>The descriptor (type + declared [Min,Max] envelope) for a registered attribute.</summary>
         public HateAttribute AttributeDef(GameplayTag attribute) => _attributes[_attrByTag[attribute.Id]];
 
-        // Per-attribute column layout: Base, Current, Min, Max contiguously at _attrCol0[a].
+        // Per-attribute column layout: Base, Current, Min, Max, MinBase, MaxBase contiguously at _attrCol0[a].
         private int BaseCol(int attr) => _attrCol0[attr];
         private int CurrentCol(int attr) => _attrCol0[attr] + 1;
-        private int MinCol(int attr) => _attrCol0[attr] + 2;
-        private int MaxCol(int attr) => _attrCol0[attr] + 3;
+        private int MinCol(int attr) => _attrCol0[attr] + 2;     // effective min (recomputed from MinBase + cap effects)
+        private int MaxCol(int attr) => _attrCol0[attr] + 3;     // effective max
+        private int MinBaseCol(int attr) => _attrCol0[attr] + 4; // persistent min cap (SetMin)
+        private int MaxBaseCol(int attr) => _attrCol0[attr] + 5; // persistent max cap (SetMax)
 
         // The Current column of a utility metric attribute, resolved from its tag. D6.1 curve passes are
         // float-only, so the metric must be a SinglePrecision attribute (typed-metric materialisation is a follow-up).
@@ -348,6 +366,8 @@ namespace Heathen.HATE
             for (int a = 0; a < _attributes.Length; a++)
             {
                 var d = _attributes[a];
+                WriteAttrCell(row, a, MinBaseCol(a), d.Min);
+                WriteAttrCell(row, a, MaxBaseCol(a), d.Max);
                 WriteAttrCell(row, a, MinCol(a), d.Min);
                 WriteAttrCell(row, a, MaxCol(a), d.Max);
                 WriteAttrCell(row, a, BaseCol(a), d.Min);
@@ -390,31 +410,39 @@ namespace Heathen.HATE
             return ReadAttrCell(actor, a, CurrentCol(a));
         }
 
-        /// <summary>The actor's dynamic minimum cap for an attribute (effects can change it).</summary>
+        /// <summary>The actor's dynamic (effective) minimum cap for an attribute, as of the last
+        /// <see cref="RecomputeCurrent"/> (cap-buff effects fold into it).</summary>
         public double GetMin(ulong actor, GameplayTag attribute)
         {
             int a = _attrByTag[attribute.Id];
             return ReadAttrCell(actor, a, MinCol(a));
         }
 
-        /// <summary>The actor's dynamic maximum cap for an attribute (e.g. Max Health; effects can change it).</summary>
+        /// <summary>The actor's dynamic (effective) maximum cap (e.g. Max Health), as of the last
+        /// <see cref="RecomputeCurrent"/> (cap-buff effects fold into it).</summary>
         public double GetMax(ulong actor, GameplayTag attribute)
         {
             int a = _attrByTag[attribute.Id];
             return ReadAttrCell(actor, a, MaxCol(a));
         }
 
-        /// <summary>Set the actor's dynamic minimum cap (clamped to the declared envelope).</summary>
+        /// <summary>Set the actor's persistent minimum cap (clamped to the declared envelope). Writes both the
+        /// base and the effective column so it reads back immediately; cap-buff effects re-fold over the base in
+        /// <see cref="RecomputeCurrent"/>.</summary>
         public void SetMin(ulong actor, GameplayTag attribute, double value)
         {
             int a = _attrByTag[attribute.Id];
+            WriteAttrCell(actor, a, MinBaseCol(a), value);
             WriteAttrCell(actor, a, MinCol(a), value);
         }
 
-        /// <summary>Set the actor's dynamic maximum cap (clamped to the declared envelope).</summary>
+        /// <summary>Set the actor's persistent maximum cap (clamped to the declared envelope). Writes both the
+        /// base and the effective column so it reads back immediately; cap-buff effects re-fold over the base in
+        /// <see cref="RecomputeCurrent"/>.</summary>
         public void SetMax(ulong actor, GameplayTag attribute, double value)
         {
             int a = _attrByTag[attribute.Id];
+            WriteAttrCell(actor, a, MaxBaseCol(a), value);
             WriteAttrCell(actor, a, MaxCol(a), value);
         }
 
@@ -492,8 +520,20 @@ namespace Heathen.HATE
         public int ApplyDuration(ulong actor, GameplayTag attribute, ModifierOp op, double magnitude, int durationTicks, GameplayTagCondition[] ongoingRequirement)
             => ApplyDurationCore(actor, _attrByTag[attribute.Id], op, magnitude, durationTicks, 0, 0, 0, 0, -1);
 
+        /// <summary>
+        /// Apply a duration CAP-BUFF or field-targeted effect (§5.3): the modifier is folded into the
+        /// attribute's <paramref name="field"/> — <see cref="HateField.Max"/> for "+10% Max Health",
+        /// <see cref="HateField.Min"/> for a floor buff, or <see cref="HateField.Current"/> for the ordinary
+        /// working-value channel. Caps fold from their persistent base (MinBase/MaxBase) each
+        /// <see cref="RecomputeCurrent"/>, so the buff auto-expires normally; the raised cap then bounds
+        /// Current's clamp. Returns the effect handle, or <see cref="InvalidEffect"/> when the store is full.
+        /// </summary>
+        public int ApplyDuration(ulong actor, GameplayTag attribute, HateField field, ModifierOp op, double magnitude, int durationTicks)
+            => ApplyDurationCore(actor, _attrByTag[attribute.Id], op, magnitude, durationTicks, 0, 0, field: field);
+
         private int ApplyDurationCore(ulong actor, int attr, ModifierOp op, double magnitude, int durationTicks,
-            int grantTags, int grantAbilities, int grantImmunity = 0, int reqMask = 0, int reqMode = -1)
+            int grantTags, int grantAbilities, int grantImmunity = 0, int reqMask = 0, int reqMode = -1,
+            HateField field = HateField.Current)
         {
             ulong r = _effects.AllocRow();
             if (r == DataStore.InvalidRow) return InvalidEffect;
@@ -511,6 +551,7 @@ namespace Heathen.HATE
             _effects.SetInt(r, (ulong)FxReqMask, reqMask);
             _effects.SetInt(r, (ulong)FxReqMode, reqMode);   // -1 = no ongoing requirement
             _effects.SetInt(r, (ulong)FxSuspended, 0);
+            _effects.SetInt(r, (ulong)FxField, (int)field);
             return (int)r;
         }
 
@@ -568,6 +609,7 @@ namespace Heathen.HATE
             _effects.SetInt(r, (ulong)FxReqMask, 0);
             _effects.SetInt(r, (ulong)FxReqMode, -1);
             _effects.SetInt(r, (ulong)FxSuspended, 0);
+            _effects.SetInt(r, (ulong)FxField, (int)HateField.Current);
             return (int)r;
         }
 
@@ -629,30 +671,41 @@ namespace Heathen.HATE
         }
 
         /// <summary>
-        /// Derive Current from Base for every attribute (one parallel System), then fold in every active
-        /// duration effect by aggregation channel (§5.3): <c>Current = override ?? (Base + ΣAdd)·ΠMul</c>.
-        /// The Current=Base pass is parallel; the per-channel accumulation is host-side over the ACTIVE
-        /// effects (cost ∝ live effects, not actor count — moving it to a dirty-driven System is future work).
+        /// Recompute every attribute's derived values from its bases and active duration effects (§5.3),
+        /// in the order caps → Current so cap buffs bound the Current clamp:
+        /// <list type="number">
+        /// <item>reset the effective caps to base (Min = MinBase, Max = MaxBase) — one parallel System;</item>
+        /// <item>fold active <see cref="HateField.Min"/>/<see cref="HateField.Max"/> effects into Min/Max;</item>
+        /// <item>derive Current = clamp(Base, Min, Max) — one parallel System over the effective caps;</item>
+        /// <item>fold active <see cref="HateField.Current"/> effects into Current: <c>clamp(override ??
+        /// (Base + ΣAdd)·ΠMul, Min, Max)</c>.</item>
+        /// </list>
+        /// The Set/clamp passes are parallel; the per-channel accumulation is host-side over the ACTIVE effects
+        /// (cost ∝ live effects, not actor count — moving it to a dirty-driven System is future work).
         /// </summary>
         public void RecomputeCurrent()
         {
-            _lens.Execute(_recomputeCurrent, _table);
-            AddActiveModifiers();
+            _lens.Execute(_recomputeCaps, _table);   // effective Min/Max <- persistent base
+            ScanActiveModifiers();                    // bucket active effects by (actor, attr, field)
+            ApplyCapModifiers();                       // fold Min/Max channels into the cap columns
+            _lens.Execute(_recomputeCurrent, _table); // Current = clamp(Base, effective Min, effective Max)
+            ApplyCurrentModifiers();                   // fold Current channel into Current, clamp to caps
         }
 
-        // Per-(actor,attrIndex) modifier channels, reused across RecomputeCurrent calls (cleared each time).
-        // Real-space (double): the per-effect aggregation reads/writes through the typed accessors, so no
-        // offset/bias math is needed here — that lives only in the bulk-System path (AddBulkModify).
+        // Per-(actor,attrIndex,field) modifier channels, reused across RecomputeCurrent calls (cleared each
+        // time). Real-space (double): the per-effect aggregation reads/writes through the typed accessors, so
+        // no offset/bias math is needed here — that lives only in the bulk-System path (AddBulkModify).
         private struct ModChannels { public double SumAdd; public double ProdMul; public bool HasOverride; public double OverrideValue; }
         private readonly Dictionary<long, ModChannels> _modAccum = new Dictionary<long, ModChannels>();
-        private static long ModKey(int actor, int attr) => ((long)actor << 32) | (uint)attr;
+        // Key packs field (2 bits) + attr (low 32 below the field) + actor. attr < 2^30 and actor < 2^32 in
+        // practice, so: actor in the high 32, field<<30 | attr in the low 32.
+        private static long ModKey(int actor, int attr, HateField field) => ((long)actor << 32) | ((long)(int)field << 30) | (uint)attr;
 
-        private void AddActiveModifiers()
+        // One pass over the active effects: accumulate each into its (actor, attr, field) channels.
+        private void ScanActiveModifiers()
         {
-            if (_effects.LiveCount == 0) return; // no active duration effects: Current is just clamp(Base)
             _modAccum.Clear();
-
-            // Pass 1: accumulate each active effect into its (actor,attrIndex) channels.
+            if (_effects.LiveCount == 0) return;
             for (int r = 0; r < _effectsCapacity; r++)
             {
                 if (!_effects.IsValid((ulong)r)) continue;
@@ -665,9 +718,10 @@ namespace Heathen.HATE
                 _effects.TryGetFloat((ulong)r, (ulong)FxMagnitude, out float mag);
                 _effects.TryGetInt((ulong)r, (ulong)FxOp, out int opCode);
                 _effects.TryGetInt((ulong)r, (ulong)FxStackCount, out int count);
+                _effects.TryGetInt((ulong)r, (ulong)FxField, out int fieldCode);
                 if (count < 1) count = 1; // stacks scale the contribution (§5.5)
 
-                long key = ModKey(actor, attr);
+                long key = ModKey(actor, attr, (HateField)fieldCode);
                 if (!_modAccum.TryGetValue(key, out var ch)) ch = new ModChannels { ProdMul = 1.0 };
                 switch ((ModifierOp)opCode)
                 {
@@ -677,19 +731,47 @@ namespace Heathen.HATE
                 }
                 _modAccum[key] = ch;
             }
+        }
 
-            // Pass 2: Current = clamp(override ?? (Base + ΣAdd)·ΠMul, dynamic Min, dynamic Max), once per
-            // touched (actor,attr). Real-space via the typed accessors; clamp uses the per-actor Min/Max cols.
+        // Aggregate a base value through a channel: override ?? (base + ΣAdd)·ΠMul.
+        private static double AggregateChannel(double baseV, in ModChannels ch)
+            => ch.HasOverride ? ch.OverrideValue : (baseV + ch.SumAdd) * ch.ProdMul;
+
+        // Fold Min/Max-field channels into the effective cap columns (base already reset by _recomputeCaps),
+        // clamped to the declared envelope by WriteAttrCell (a cap cannot exceed the storage width).
+        private void ApplyCapModifiers()
+        {
+            if (_modAccum.Count == 0) return;
             foreach (var kv in _modAccum)
             {
+                var field = (HateField)(int)((kv.Key >> 30) & 0x3);
+                if (field == HateField.Current) continue;
                 ulong actor = (ulong)(uint)(kv.Key >> 32);
-                int attr = (int)(kv.Key & 0xffffffff);
-                var ch = kv.Value;
-                double baseV = ReadAttrCell(actor, attr, BaseCol(attr));
-                double cur = ch.HasOverride ? ch.OverrideValue : (baseV + ch.SumAdd) * ch.ProdMul;
+                int attr = (int)((uint)kv.Key & 0x3fffffff);
+                int capCol = field == HateField.Max ? MaxCol(attr) : MinCol(attr);
+                int baseCol = field == HateField.Max ? MaxBaseCol(attr) : MinBaseCol(attr);
+                double v = AggregateChannel(ReadAttrCell(actor, attr, baseCol), kv.Value);
+                WriteAttrCell(actor, attr, capCol, v);
+            }
+        }
+
+        // Fold the Current-field channel into Current, once per touched (actor,attr). Real-space via the typed
+        // accessors; clamp uses the per-actor effective Min/Max cols (clamp to Max then to Min, so Min wins —
+        // matching the _recomputeCurrent IR — which matters once a cap buff can push Min above Max).
+        private void ApplyCurrentModifiers()
+        {
+            if (_modAccum.Count == 0) return;
+            foreach (var kv in _modAccum)
+            {
+                var field = (HateField)(int)((kv.Key >> 30) & 0x3);
+                if (field != HateField.Current) continue;
+                ulong actor = (ulong)(uint)(kv.Key >> 32);
+                int attr = (int)((uint)kv.Key & 0x3fffffff);
+                double cur = AggregateChannel(ReadAttrCell(actor, attr, BaseCol(attr)), kv.Value);
                 double mn = ReadAttrCell(actor, attr, MinCol(attr));
                 double mx = ReadAttrCell(actor, attr, MaxCol(attr));
-                cur = cur < mn ? mn : (cur > mx ? mx : cur);
+                if (cur > mx) cur = mx;
+                if (cur < mn) cur = mn;
                 WriteAttrCell(actor, attr, CurrentCol(attr), cur);
             }
         }
@@ -1750,13 +1832,15 @@ namespace Heathen.HATE
             public readonly int GrantAbilities;
             public readonly int GrantImmunity;
             public readonly int EffectId;      // -1 = non-stacking
+            public readonly HateField Field;   // which attribute field the modifier targets (Current/Min/Max)
 
             public EffectSnapshot(int handle, int actor, int attr, ModifierOp op, float magnitude, int endTick,
-                int stackCount, bool suspended, int grantTags, int grantAbilities, int grantImmunity, int effectId)
+                int stackCount, bool suspended, int grantTags, int grantAbilities, int grantImmunity, int effectId,
+                HateField field)
             {
                 Handle = handle; Actor = actor; Attr = attr; Op = op; Magnitude = magnitude; EndTick = endTick;
                 StackCount = stackCount; Suspended = suspended; GrantTags = grantTags; GrantAbilities = grantAbilities;
-                GrantImmunity = grantImmunity; EffectId = effectId;
+                GrantImmunity = grantImmunity; EffectId = effectId; Field = field;
             }
         }
 
@@ -1786,8 +1870,9 @@ namespace Heathen.HATE
                 _effects.TryGetInt((ulong)r, (ulong)FxGrantAbilities, out int grantAbilities);
                 _effects.TryGetInt((ulong)r, (ulong)FxGrantImmunity, out int grantImmunity);
                 _effects.TryGetInt((ulong)r, (ulong)FxEffectId, out int effectId);
+                _effects.TryGetInt((ulong)r, (ulong)FxField, out int field);
                 results.Add(new EffectSnapshot(r, actor, attr, (ModifierOp)op, mag, endTick, stacks,
-                    suspended != 0, grantTags, grantAbilities, grantImmunity, effectId));
+                    suspended != 0, grantTags, grantAbilities, grantImmunity, effectId, (HateField)field));
             }
         }
 
@@ -1798,6 +1883,7 @@ namespace Heathen.HATE
             _eligibleView?.Dispose();
             _utilityView?.Dispose();
             _choiceView?.Dispose();
+            _recomputeCaps?.Dispose();
             _recomputeCurrent?.Dispose();
             _recomputeTags?.Dispose();
             _recomputeAbilities?.Dispose();
