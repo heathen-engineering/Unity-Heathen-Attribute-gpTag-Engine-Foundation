@@ -1,4 +1,4 @@
-# HATE Foundation — Heathen Attribute [gp]Tag Engine
+# Heathen Attribute [gameplay]Tag Engine (HATE) Foundation
 
 ![License](https://img.shields.io/badge/License-Apache_2.0-blue?style=flat-square)
 ![Maintained](https://img.shields.io/badge/Maintained%3F-yes-green?style=flat-square)
