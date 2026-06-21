@@ -155,8 +155,8 @@ ai.ScoreAbility(slot: 0, healAbility,
     new[] { new Consideration(Health, Curve.Linear(0, 1000, slope: -1f, intercept: 1f)) },
     Aggregate.Product);
 
-ai.PerturbScores(noiseLo: 0f, noiseHi: 1f, seed: 1234); // variance × reproducible noise
-ai.Select();                                            // noisy argmax → per-actor Choice column
+ai.PerturbScores(seed: 1234, tick: 0, noiseLo: 0f, noiseHi: 1f); // variance × reproducible noise
+ai.Select();                                                     // noisy argmax → per-actor Choice column
 int choice = ai.GetChoice(actor);
 ```
 

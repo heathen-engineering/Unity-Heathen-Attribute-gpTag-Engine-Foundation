@@ -46,7 +46,7 @@ namespace Heathen.HATE
         // Columns: Actor, Attr (which attribute), Magnitude (additive), EndTick, Active (1=live).
         private readonly DataStore _effects;
         private readonly int _effectsCapacity;
-        private const int FxActor = 0, FxAttr = 1, FxMagnitude = 2, FxEndTick = 3, FxActive = 4, FxGrantTags = 5, FxGrantAbilities = 6, FxOp = 7, FxEffectId = 8, FxStackCount = 9, FxGrantImmunity = 10, FxReqMask = 11, FxReqMode = 12, FxSuspended = 13, FxField = 14;
+        private const int FxActor = 0, FxAttr = 1, FxMagnitude = 2, FxEndTick = 3, FxActive = 4, FxGrantTags = 5, FxGrantAbilities = 6, FxOp = 7, FxEffectId = 8, FxStackCount = 9, FxGrantImmunity = 10, FxReqAll = 11, FxReqMode = 12, FxSuspended = 13, FxField = 14, FxReqNone = 15;
         private const int EffectsStoreIndex = 1;
 
         private DataView _activeView;     // over the effects Active column, for reclaim read-back
@@ -67,6 +67,10 @@ namespace Heathen.HATE
         //    columns, computed across ALL actors as branchless column passes, then scanned. ──
         private readonly int _eligibleCol;   // Int32
         private readonly int _utilityCol;    // Float
+        // Float scratch holding a non-float (integral/double) metric's REAL Current, materialised for the
+        // float-only utility/curve passes (§8). De-offsets integral attributes back to real space.
+        private readonly int _metricScratchCol; // Float
+        private readonly int _capacity;         // actor row capacity (for live-row managed scans)
         private DataView _eligibleView;
         private int[] _eligibleScratch;
         private DataView _utilityView;
@@ -155,8 +159,9 @@ namespace Heathen.HATE
             // caps (recomputed each step from MinBase/MaxBase + active cap-buff effects, §5.3); MinBase/MaxBase
             // are the persistent caps that SetMin/SetMax write. Then BaseTags, CurrentTags, Selected,
             // Eligible (Int32), Utility (Float), BaseAbilities + GrantedAbilities (Int32, intrinsic vs
-            // effective grants); then (when abilityScoreSlots>0) K Score columns (Float), Variance (Float),
-            // Command (Int32), Choice (Int32), WeightedSum scratch (Float).
+            // effective grants), BaseImmunity + Immunity (Int32), MetricScratch (Float, materialises a non-float
+            // metric's real Current for the float passes); then (when abilityScoreSlots>0) K Score columns
+            // (Float), Variance (Float), Command (Int32), Choice (Int32), WeightedSum scratch (Float).
             _abilityScoreSlots = abilityScoreSlots;
             int attrCols = attributes.Length * 6;
             for (int a = 0; a < attributes.Length; a++) _attrCol0[a] = a * 6;
@@ -169,8 +174,10 @@ namespace Heathen.HATE
             _grantedAbilitiesCol = attrCols + 6;
             _baseImmunityCol = attrCols + 7;
             _immunityCol = attrCols + 8;
+            _metricScratchCol = attrCols + 9;
+            _capacity = capacity;
 
-            int colCount = attrCols + 9;
+            int colCount = attrCols + 10;
             if (abilityScoreSlots > 0)
             {
                 _scoreCol0 = colCount;
@@ -205,6 +212,7 @@ namespace Heathen.HATE
             colNames[_grantedAbilitiesCol] = "GrantedAbilities"; colTypes[_grantedAbilitiesCol] = DataLensValueType.Int32;
             colNames[_baseImmunityCol] = "BaseImmunity";         colTypes[_baseImmunityCol] = DataLensValueType.Int32;
             colNames[_immunityCol] = "Immunity";                 colTypes[_immunityCol] = DataLensValueType.Int32;
+            colNames[_metricScratchCol] = "MetricScratch";       colTypes[_metricScratchCol] = DataLensValueType.Float;
             if (abilityScoreSlots > 0)
             {
                 for (int s = 0; s < abilityScoreSlots; s++)
@@ -226,12 +234,13 @@ namespace Heathen.HATE
             // Active-effects store: a row per live duration effect (no heap object — the §5.2 win).
             _effectsCapacity = capacity * 4; // a few effects per actor; fixed, recycled on expiry
             _effects = new DataStore(
-                new[] { "Actor", "Attr", "Magnitude", "EndTick", "Active", "GrantTags", "GrantAbilities", "Op", "EffectId", "StackCount", "GrantImmunity", "ReqMask", "ReqMode", "Suspended", "Field" },
+                new[] { "Actor", "Attr", "Magnitude", "EndTick", "Active", "GrantTags", "GrantAbilities", "Op", "EffectId", "StackCount", "GrantImmunity", "ReqAll", "ReqMode", "Suspended", "Field", "ReqNone" },
                 new[] { DataLensValueType.Int32, DataLensValueType.Int32, DataLensValueType.Float,
                         DataLensValueType.Int32, DataLensValueType.Int32, DataLensValueType.Int32,
                         DataLensValueType.Int32, DataLensValueType.Int32, DataLensValueType.Int32,
                         DataLensValueType.Int32, DataLensValueType.Int32, DataLensValueType.Int32,
-                        DataLensValueType.Int32, DataLensValueType.Int32, DataLensValueType.Int32 },
+                        DataLensValueType.Int32, DataLensValueType.Int32, DataLensValueType.Int32,
+                        DataLensValueType.Int32 },
                 (ulong)_effectsCapacity);
 
             _table = new[] { _store, _effects };
@@ -312,15 +321,47 @@ namespace Heathen.HATE
         private int MinBaseCol(int attr) => _attrCol0[attr] + 4; // persistent min cap (SetMin)
         private int MaxBaseCol(int attr) => _attrCol0[attr] + 5; // persistent max cap (SetMax)
 
-        // The Current column of a utility metric attribute, resolved from its tag. D6.1 curve passes are
-        // float-only, so the metric must be a SinglePrecision attribute (typed-metric materialisation is a follow-up).
+        // The float operand column for a utility metric attribute, resolved from its tag. Curve/weight passes
+        // are float-only: a SinglePrecision attribute feeds its Current column directly (branchless); an
+        // integral/double attribute is materialised (de-offset to real space) into the shared MetricScratch
+        // column via a managed live-row pass, and that scratch is returned. (Materialise-then-consume is safe
+        // for back-to-back considerations because each curve pass reads the scratch before the next overwrites it.)
         private int MetricCol(GameplayTag metric)
         {
             int a = _attrByTag[metric.Id];
-            if (_attributes[a].StorageType != DataLensValueType.Float)
-                throw new NotSupportedException(
-                    "Consideration metric must be a SinglePrecision attribute in D6.1 (curve passes are float-only).");
-            return CurrentCol(a);
+            if (_attributes[a].StorageType == DataLensValueType.Float)
+                return CurrentCol(a);
+            MaterialiseRealCurrent(a, _metricScratchCol);
+            return _metricScratchCol;
+        }
+
+        // Write each live actor's REAL Current of attribute `attr` (de-offset for integral/double types) into
+        // the Float column `destFloatCol`, so a non-float metric can drive the float-only utility/curve passes.
+        // A managed per-row pass (the typed branchless predicate primitive is Int32/Float-only at the C ABI);
+        // float metrics never reach here, so the mass-AI hot path stays fully branchless.
+        private void MaterialiseRealCurrent(int attr, int destFloatCol)
+        {
+            int cur = CurrentCol(attr);
+            for (ulong a = 0; a < (ulong)_capacity; a++)
+            {
+                if (!_store.IsValid(a)) continue;
+                _store.SetFloat(a, (ulong)destFloatCol, (float)ReadAttrCell(a, attr, cur));
+            }
+        }
+
+        // Knock the Eligible flag to 0 for every live actor that cannot afford `cost` real units of attribute
+        // `attr` (Base < cost). A managed live-row pass for non-float cost attributes (the branchless
+        // RunIntWhereFloat fast path covers SinglePrecision); reads through ReadAttrCell so offset/width are
+        // handled for any integral or double cost attribute.
+        private void KnockOutUnaffordable(int attr, double cost)
+        {
+            int baseCol = BaseCol(attr);
+            for (ulong a = 0; a < (ulong)_capacity; a++)
+            {
+                if (!_store.IsValid(a)) continue;
+                if (ReadAttrCell(a, attr, baseCol) < cost)
+                    _store.SetInt(a, (ulong)_eligibleCol, 0);
+            }
         }
 
         // Encode a real value into attribute a's cell at `col`: clamp to the declared envelope (storage
@@ -514,11 +555,15 @@ namespace Heathen.HATE
         /// tests <paramref name="ongoingRequirement"/> against the actor's status; while it fails the effect is
         /// SUSPENDED (its modifiers + grants stop applying) but is NOT removed — it resumes when the condition
         /// returns, and still expires on its EndTick. Returns the effect handle.
-        /// TODO(condition-compiler): compile the GameplayTagCondition[] to the stored reqMask/reqMode; until
-        /// then the requirement is recorded but not enforced (reqMode -1).
+        /// The <paramref name="ongoingRequirement"/> is compiled (via <see cref="CompileStatusCondition"/>) to a
+        /// require-all / require-none status-bit pair stored on the row; each <see cref="RecomputeSuspension"/>
+        /// re-tests it against the actor's CurrentTags. (AND-combined Exists/NotExists only, per D6.1.)
         /// </summary>
         public int ApplyDuration(ulong actor, GameplayTag attribute, ModifierOp op, double magnitude, int durationTicks, GameplayTagCondition[] ongoingRequirement)
-            => ApplyDurationCore(actor, _attrByTag[attribute.Id], op, magnitude, durationTicks, 0, 0, 0, 0, -1);
+        {
+            CompileStatusCondition(ongoingRequirement, out int reqAll, out int reqNone);
+            return ApplyDurationCore(actor, _attrByTag[attribute.Id], op, magnitude, durationTicks, 0, 0, 0, reqAll, reqNone, 0);
+        }
 
         /// <summary>
         /// Apply a duration CAP-BUFF or field-targeted effect (§5.3): the modifier is folded into the
@@ -532,7 +577,7 @@ namespace Heathen.HATE
             => ApplyDurationCore(actor, _attrByTag[attribute.Id], op, magnitude, durationTicks, 0, 0, field: field);
 
         private int ApplyDurationCore(ulong actor, int attr, ModifierOp op, double magnitude, int durationTicks,
-            int grantTags, int grantAbilities, int grantImmunity = 0, int reqMask = 0, int reqMode = -1,
+            int grantTags, int grantAbilities, int grantImmunity = 0, int reqAll = 0, int reqNone = 0, int reqMode = -1,
             HateField field = HateField.Current)
         {
             ulong r = _effects.AllocRow();
@@ -548,10 +593,11 @@ namespace Heathen.HATE
             _effects.SetInt(r, (ulong)FxEffectId, -1); // non-stacking
             _effects.SetInt(r, (ulong)FxStackCount, 1);
             _effects.SetInt(r, (ulong)FxGrantImmunity, grantImmunity);
-            _effects.SetInt(r, (ulong)FxReqMask, reqMask);
+            _effects.SetInt(r, (ulong)FxReqAll, reqAll);
             _effects.SetInt(r, (ulong)FxReqMode, reqMode);   // -1 = no ongoing requirement
             _effects.SetInt(r, (ulong)FxSuspended, 0);
             _effects.SetInt(r, (ulong)FxField, (int)field);
+            _effects.SetInt(r, (ulong)FxReqNone, reqNone);
             return (int)r;
         }
 
@@ -606,10 +652,11 @@ namespace Heathen.HATE
             _effects.SetInt(r, (ulong)FxEffectId, effectId);
             _effects.SetInt(r, (ulong)FxStackCount, 1);
             _effects.SetInt(r, (ulong)FxGrantImmunity, 0);
-            _effects.SetInt(r, (ulong)FxReqMask, 0);
+            _effects.SetInt(r, (ulong)FxReqAll, 0);
             _effects.SetInt(r, (ulong)FxReqMode, -1);
             _effects.SetInt(r, (ulong)FxSuspended, 0);
             _effects.SetInt(r, (ulong)FxField, (int)HateField.Current);
+            _effects.SetInt(r, (ulong)FxReqNone, 0);
             return (int)r;
         }
 
@@ -1156,9 +1203,12 @@ namespace Heathen.HATE
                 if (active == 0) continue;
                 _effects.TryGetInt((ulong)r, (ulong)FxReqMode, out int mode);
                 if (mode < 0) continue; // no ongoing requirement -> never suspended
-                _effects.TryGetInt((ulong)r, (ulong)FxReqMask, out int mask);
+                _effects.TryGetInt((ulong)r, (ulong)FxReqAll, out int reqAll);
+                _effects.TryGetInt((ulong)r, (ulong)FxReqNone, out int reqNone);
                 _effects.TryGetInt((ulong)r, (ulong)FxActor, out int actor);
-                bool met = MatchesTrigger(GetCurrentTags((ulong)actor), new TagTrigger(mask, (TriggerMode)mode));
+                int tags = GetCurrentTags((ulong)actor);
+                // Requirement met = every required-present bit held AND no required-absent bit present.
+                bool met = (tags & reqAll) == reqAll && (tags & reqNone) == 0;
                 _effects.SetInt((ulong)r, (ulong)FxSuspended, met ? 0 : 1);
             }
         }
@@ -1410,11 +1460,17 @@ namespace Heathen.HATE
             _lens.RunInt(_store, (ulong)_eligibleCol, SystemOp.Set, 1); // all eligible to start
 
             if (ability.CostAttr.IsValid)
-                // knock out where Base[cost] < CostAmount (int op gated by a float predicate).
-                // NOTE: BaseCol is float only when the cost attribute is a SinglePrecision attribute; an
-                // integral/offset cost attribute would need a typed predicate (follow-up).
-                _lens.RunIntWhereFloat(_store, (ulong)_eligibleCol, SystemOp.Set, 0,
-                    (ulong)BaseCol(_attrByTag[ability.CostAttr.Id]), CompareOp.Less, (float)ability.CostAmount);
+            {
+                // knock out where Base[cost] < CostAmount. SinglePrecision cost = one branchless int-op-gated-by-
+                // float-predicate pass; integral/double cost = a managed live-row scan (the C-ABI typed predicate
+                // is Int32/Float-only and integral attributes store offset-encoded at a narrow width).
+                int ca = _attrByTag[ability.CostAttr.Id];
+                if (_attributes[ca].StorageType == DataLensValueType.Float)
+                    _lens.RunIntWhereFloat(_store, (ulong)_eligibleCol, SystemOp.Set, 0,
+                        (ulong)BaseCol(ca), CompareOp.Less, (float)ability.CostAmount);
+                else
+                    KnockOutUnaffordable(ca, ability.CostAmount);
+            }
 
             int cdMask = StatusMask(ability.CooldownTag);
             if (cdMask != 0)
@@ -1480,10 +1536,12 @@ namespace Heathen.HATE
         {
             EvaluateEligibility(ability);
             int wa = _attrByTag[weightAttr.Id];
-            if (_attributes[wa].StorageType != DataLensValueType.Float)
-                throw new NotSupportedException(
-                    "EvaluateUtility metric must be a SinglePrecision attribute in D6.1 (typed-metric materialisation into the float Utility column is a follow-up).");
-            _lens.RunFloatColumn(_store, (ulong)_utilityCol, SystemOp.Set, (ulong)CurrentCol(wa));
+            // Seed Utility with the weight attribute's real Current: branchless column copy for SinglePrecision,
+            // a managed de-offset materialisation for an integral/double weight attribute.
+            if (_attributes[wa].StorageType == DataLensValueType.Float)
+                _lens.RunFloatColumn(_store, (ulong)_utilityCol, SystemOp.Set, (ulong)CurrentCol(wa));
+            else
+                MaterialiseRealCurrent(wa, _utilityCol);
             _lens.RunFloat(_store, (ulong)_utilityCol, SystemOp.Mul, slope);
             _lens.RunFloat(_store, (ulong)_utilityCol, SystemOp.Add, offset);
             _lens.RunFloat(_store, (ulong)_utilityCol, SystemOp.Max, 0f);
@@ -1723,17 +1781,6 @@ namespace Heathen.HATE
 
         /// <summary>Map a row in the last <see cref="CopyChoices"/> read-back back to its actor handle.</summary>
         public ulong ChoiceSourceActor(int viewRow) => _choiceView.SourceRow((ulong)viewRow);
-
-        private bool MatchesTrigger(int currentTags, TagTrigger t)
-        {
-            switch (t.Mode)
-            {
-                case TriggerMode.RequireAll: return (currentTags & t.Mask) == t.Mask;
-                case TriggerMode.RequireAny: return (currentTags & t.Mask) != 0;
-                case TriggerMode.Exclude:    return (currentTags & t.Mask) == 0;
-                default:                     return true;
-            }
-        }
 
         private void OrCurrentTags(ulong actor, int mask)
         {
