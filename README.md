@@ -25,204 +25,79 @@ Learn more or explore other ways to support @ [heathen.group/kb](https://heathen
 
 -----
 
-## What it does
+## Status: runtime built on DataLens
 
-HATE gives you full Unreal-GAS *feature* parity without its object-oriented architecture. Everything is a row, a column, or a tag-addressed bitmask, mutated by data-described Systems. The runtime is one type:
+> The runtime is **built and working** as a pure DataLens consumer — HATE owns no storage; it declares a
+> DataLens schema and rides the Lens (entities, traits, effects, abilities, the engine bridge, and the
+> authoring → codegen pipeline). Verified end-to-end against the native library and in the Unity Test Runner.
+> The HATE Forge authoring window and a few GAS extras (cues, immunity, ability charges/targeting, prediction)
+> are the remaining items.
 
-| Type | Purpose |
-|------|---------|
-| **`HateWorld`** | The simulation: actors (rows) × attributes (typed columns), the active-effects store, status/ability/immunity bitmasks, and a `Lens` that drives it all. |
-| **`HateAttribute`** | A typed, ranged attribute descriptor `(GameplayTag, type, min, max)` → narrowest DataLens column. |
-| **`AbilityDef`** | A tag-addressed ability: cost, cooldown, activation requirement, cue, and a delayed payload effect. |
-| **`Consideration`** | A response-curve over a metric attribute — the unit of utility-AI scoring. |
+The authoritative design + implementation status live in the SourceRepo at `Assets/Toolkits/DesignSpecs/`:
+- **`HATE-Spec.md`** — the runtime/product spec (the model summarised here).
+- **`HATE-Authoring-Spec.md`** — the document model + HATE Forge (authoring + codegen).
 
-The following features are included:
+## The model
 
-- **Typed, ranged attributes** — declare each as `(tag, Integral / SinglePrecision / DoublePrecision, min, max)`. HATE picks the narrowest storage width, offset-encodes integrals, and range-clamps every write. Each attribute is four working fields: `Base`, `Current`, dynamic `Min`, dynamic `Max`.
-- **Instant effects** — `ApplyInstant` (one actor) / `ApplyInstantAll` (every live actor in one parallel pass), with `Add` / `Multiply` / `Override`.
-- **Duration effects (buff density)** — `ApplyDuration` stores an active effect as a single row (no heap); `ExpireEffects` clears due effects in one parallel vector-compare System. Scales to 100k+ active effects.
-- **Cap buffs** — `ApplyDuration(..., HateField.Max, ...)` targets an attribute *field* (e.g. "+10% Max Health for 30 ticks"); caps fold from a persistent base each recompute and auto-expire.
-- **Stacking** — `ApplyStackingDuration` collapses re-applications to one row carrying a `StackCount`, with `RefreshDuration` / `KeepLongest` / `KeepExisting` policies.
-- **Aggregation channels** — `RecomputeCurrent` derives `Current = clamp(Override ?? (Base + ΣAdd)·ΠMul, Min, Max)`.
-- **Status & conditions** — per-actor status as a 32-bit hot-tag bitmask; `GameplayTagCondition`s are **compiled** to DataLens batch predicates (`Exists` / `NotExists` → bitmask tests), never evaluated per-actor in hot paths. `CountMatching`, `ApplyInstantWhere`.
-- **Abilities** — `RegisterAbility` / `GrantAbility` / `CanActivate` / `TryActivate`. Cost = an Instant on a resource attribute, cooldown = a duration effect granting a cooldown tag, requirement = compiled conditions, plus an activation cue and a delayed payload task fired by `AdvanceAbilities`.
-- **Immunity** — per-actor immunity mask gates incoming effects by their asset tags (`TryApplyInstant` / `TryApplyDuration`, with a blocked cue).
-- **Mass utility AI** — `ScoreAbility` (response-curve `Consideration`s over metric attributes) → `PerturbScores` (per-actor variance × reproducible noise) → `Select` (noisy argmax) → a `Choice` column. Deciding between abilities for 100k actors is sub-millisecond.
-- **Cues** — `EmitCue` / `PendingCues` cosmetic output stream; never simulation state, drained by presentation each frame.
-- **Engine-agnostic by design** — the runtime is plain C# over the two Foundations; the same model is realised once per engine.
+HATE is one runtime primitive (a typed DataStore + columns + an optional **System**) expressed as several
+authoring concepts, all GameplayTag-addressed and project-wide:
 
----
+- **Attributes** — `(tag, datatype)`; caps (`MaxHealth`) are ordinary attributes, not a built-in range.
+- **Traits** — an ECS component table: a per-trait DataLens store of attributes plus its **Trait Systems** (the
+  passives, run as columnar kernels via `Lens.RunSystem`). One store per trait; an **EntityCatalog** relates an
+  entity to its row in each trait via dereference index columns. `EntityID` is simply the catalog row index
+  (stale-handle safety is an opt-in game trait, not baked in) — an entity need not be an actor; a crate, a
+  weather front, or a terrain region are all entities.
+- **Effects / Abilities** — tall stores (one row per instance per entity, keyed by an `EntityIndex` column): a
+  tag + a static definition + instance state. Effects tick via **Trait Systems** and aggregate
+  (`Current = override ?? (Base + ΣAdd)·ΠMul`, stacking-aware, auto-reverting); abilities resolve via **Entity
+  Systems** (cross-trait, hydrated View + write-back). Cost = an Effect, cooldown = a Condition.
+- **Conditions** — one unified predicate (tag presence, attribute comparison, trait membership) compiled to
+  DataLens batch predicates, with interval-encoded hierarchical tag matching.
+- **Resolution** — effects carry a tag→value payload + context; an Entity System resolves them through a
+  Targetable buffer (mitigation, redirect, contextual scaling), with seeded, reproducible RNG.
+
+100k+ entities under active effects simulate as branchless column passes with zero per-effect GC objects.
+Utility AI is **Wyrd's** concern (a later product), not HATE's: HATE is deterministic, Wyrd chooses.
 
 ## Requirements
 
 - Unity **2021.3** or compatible
 - [**DataLens Foundation**](https://github.com/heathen-engineering/Unity-DataLens-Foundation) (`com.heathen.datalensfoundation`)
 - [**GameplayTags Foundation**](https://github.com/heathen-engineering/Unity-GameplayTags-Foundation) (`com.heathen.gameplaytags`)
-
----
-
-## Installation
-
-### Via Unity Package Manager (UPM)
-
-Install the two dependency Foundations first (Add package from git URL), then HATE:
-
-1. In Unity, go to `Window > Package Manager`.
-2. Click **+** > **Add package from git URL**.
-3. Enter:
-   ```
-   https://github.com/heathen-engineering/Unity-Heathen-Attribute-gpTag-Engine-Foundation.git?path=/com.heathen.hatefoundation
-   ```
-
------
-
-## Setup & Workflow
-
-### 1. Define Tags & Build a World
-
-Register your attribute / status / ability tags (see the GameplayTags Foundation), then declare a world:
-
-```csharp
-using Heathen.HATE;
-using Heathen.GameplayTags;
-
-GameplayTag Health   = GameplayTag.FromName("Combat.Attributes.Health");
-GameplayTag Mana     = GameplayTag.FromName("Combat.Attributes.Mana");
-GameplayTag Stunned  = GameplayTag.FromName("Combat.Status.Stunned");
-GameplayTag Fireball = GameplayTag.FromName("Combat.Abilities.Fireball");
-GameplayTag CdFire   = GameplayTag.FromName("Combat.Status.Cooldown.Fireball");
-
-using var world = new HateWorld(
-    new[]
-    {
-        new HateAttribute(Health, HateValueType.SinglePrecision, 0, 1000),
-        new HateAttribute(Mana,   HateValueType.SinglePrecision, 0, 500),
-    },
-    new[] { Stunned, CdFire },   // hot status tags (max 32)
-    capacity: 10_000);
-```
-
-### 2. Spawn Actors & Apply Effects
-
-```csharp
-ulong actor = world.SpawnActor();      // a row handle (InvalidActor when full)
-world.SetBase(actor, Health, 800);
-
-world.ApplyInstant(actor, Health, ModifierOp.Add, -50);              // permanent: Base 800 → 750
-world.ApplyDuration(actor, Health, ModifierOp.Add, 100, durationTicks: 5);   // transient Current buff
-world.ApplyDuration(actor, Health, HateField.Max, ModifierOp.Multiply, 1.1, durationTicks: 5); // +10% Max cap
-
-world.RecomputeCurrent(); // fold caps → derive Current = clamp(Base + modifiers, Min, Max)
-double hp = world.GetCurrent(actor, Health);
-```
-
-### 3. The Step Loop
-
-```csharp
-void FixedStep()
-{
-    world.AdvanceTick();        // advance the sim clock
-    world.AdvanceAbilities();   // fire any delayed ability payloads
-    world.ExpireEffects();      // clear due effects (one parallel System) + recycle slots
-    world.RecomputeTags();      // CurrentTags = BaseTags OR active grants
-    world.RecomputeCurrent();   // re-derive every attribute's caps + Current
-    // drain world.PendingCues into your presentation layer, then world.ClearCues();
-}
-```
-
-### 4. Abilities
-
-```csharp
-world.RegisterAbility(new AbilityDef(
-    id: Fireball, costAttr: Mana, costAmount: 20,
-    cooldownTicks: 2, cooldownTag: CdFire,
-    requirement: new[] { new GameplayTagCondition { Tag = Stunned, Comparison = GameplayTagComparisonOp.NotExists } }));
-
-world.GrantAbility(actor, Fireball);
-world.RecomputeTags();
-
-if (world.TryActivate(actor, Fireball))   // spends Mana, starts cooldown, blocks re-fire this step
-    Debug.Log("Fireball cast");
-```
-
-### 5. Mass Utility AI
-
-```csharp
-using var ai = new HateWorld(attributes, statusTags, abilityScoreSlots: 2, capacity: 100_000);
-
-// Score each ability via response-curve considerations over metric attributes
-ai.ScoreAbility(slot: 0, healAbility,
-    new[] { new Consideration(Health, Curve.Linear(0, 1000, slope: -1f, intercept: 1f)) },
-    Aggregate.Product);
-
-ai.PerturbScores(seed: 1234, tick: 0, noiseLo: 0f, noiseHi: 1f); // variance × reproducible noise
-ai.Select();                                                     // noisy argmax → per-actor Choice column
-int choice = ai.GetChoice(actor);
-```
-
------
-
-## API Reference
-
-### `HateWorld` — actors & attributes
-
-| Member | Description |
-|--------|-------------|
-| `new HateWorld(attributes, [statusTags], [abilityScoreSlots], capacity)` | Build a fixed-capacity world |
-| `SpawnActor()` / `DespawnActor(actor)` / `IsAlive` | Actor lifecycle (`InvalidActor` when full) |
-| `SetBase` / `GetBase` / `GetCurrent(actor, tag)` | Permanent value vs derived working value |
-| `GetMin` / `GetMax` / `SetMin` / `SetMax(actor, tag, v)` | Per-actor dynamic caps |
-| `AttributeIndex` / `HasAttribute` / `AttributeDef(tag)` | Attribute lookups |
-
-### `HateWorld` — effects
-
-| Member | Description |
-|--------|-------------|
-| `ApplyInstant(actor, tag, op, mag)` / `ApplyInstantAll(tag, op, mag)` | Permanent change (one / all live actors) |
-| `ApplyDuration(actor, tag, [op], mag, ticks, [grantStatus])` | Transient Current-channel effect |
-| `ApplyDuration(actor, tag, HateField field, op, mag, ticks)` | Cap-buff / field-targeted effect |
-| `ApplyStackingDuration(...)` / `GetStackCount` | Collapsing stacks with refresh policy |
-| `AdvanceTick` / `ExpireEffects` / `RecomputeCurrent` | The per-step effect pipeline |
-| `GetActiveEffects(list)` / `EffectSnapshot` | Inspect active effects (for tooling) |
-
-### `HateWorld` — status, abilities, immunity
-
-| Member | Description |
-|--------|-------------|
-| `SetBaseStatus` / `ClearBaseStatus` / `HasStatus` / `RecomputeTags` | Per-actor status tags |
-| `CountMatching(conditions)` / `ApplyInstantWhere(...)` | Compiled-condition batch queries |
-| `RegisterAbility` / `GrantAbility` / `RevokeAbility` / `HasAbility` | Ability catalogue & grants |
-| `CanActivate` / `TryActivate(actor, ability)` / `AdvanceAbilities` | Activation pipeline + delayed payloads |
-| `SetBaseImmunity` / `IsImmuneTo` / `TryApplyInstant` / `TryApplyDuration` | Immunity gating |
-
-### `HateWorld` — mass utility AI
-
-| Member | Description |
-|--------|-------------|
-| `ScoreAbility(slot, ability, considerations, aggregate)` | Response-curve scoring into a score column |
-| `PerturbScores(...)` / `Select()` | Variance-noise perturbation → noisy-argmax `Choice` |
-| `EvaluateEligibility` / `CountEligible` / `EvaluateUtility` / `BestActorByUtility` | Batch eligibility + linear-weight utility |
-| `GetChoice` / `GetUtility` / `SetVariance` / `SetCommand(actor, ...)` | Per-actor AI accessors |
-
-### Supporting types
-
-| Type | Members |
-|------|---------|
-| `HateValueType` | `Integral`, `SinglePrecision`, `DoublePrecision` |
-| `HateField` | `Current`, `Min`, `Max` |
-| `ModifierOp` | `Add`, `Multiply`, `Override` |
-| `StackRefresh` | `RefreshDuration`, `KeepLongest`, `KeepExisting` |
-| `Aggregate` | `Product`, `WeightedSum` |
-| `AbilityDef` | `Id`, `CostAttr`, `CostAmount`, `CooldownTicks`, `CooldownTag`, `Requirement`, `ActivateCue`, `EffectAttr`/`EffectOp`/`EffectMag`/`EffectDelayTicks`/`EffectCue` |
-| `Consideration` | `MetricAttr`, `Curve`, `Weight` |
-| `CueEvent` | `Cue`, `Actor`, `Magnitude` |
-
------
+- [**Lexicon Foundation**](https://github.com/heathen-engineering/Unity-Lexicon-Localisation-Foundation) (`com.heathen.lexiconfoundation`) — localised display
 
 ## Namespaces
 
 | Namespace | Contents |
 |-----------|----------|
-| `Heathen.HATE` | All runtime types: `HateWorld`, `HateAttribute`, `AbilityDef`, `Consideration`, `CueEvent`, and the enums |
+| `Heathen.HATE` | The runtime: `HateWorld`, `HateSchema`/`HateTrait`/`HateAttribute`, `HateArchetype`, `EntityId`, `HateModifier`/`HateAbilityDef`. |
+| `Heathen.HATE.Toolkit` | Engine-bridge MonoBehaviours (`HATE_Entity`, `HateEntityBridge`); paid authoring/debugger layers. |
 
-Design notes live in the SourceRepo at `Assets/Toolkits/DesignSpecs/HATE-Spec.md`.
+## Quick start
+
+```csharp
+// 1. Declare the world: traits (attribute columns) + an effects store. HATE builds the DataLens schema.
+var schema = new HateSchema(capacity: 1000,
+        new HateTrait("HATE.Trait.Combat", 1000,
+            new HateAttribute("HATE.Attribute.Health", DataLensValueType.Int32, 100),
+            new HateAttribute("HATE.Attribute.MaxHealth", DataLensValueType.Int32, 100)))
+    .WithEffects("HATE.Store.Effects", 4000);
+
+using var world = new HateWorld(schema);
+
+// 2. Spawn from an archetype recipe (returns the entity = its catalog row index).
+var goblin = world.Spawn(new HateArchetype()
+    .With("HATE.Trait.Combat").Set("HATE.Attribute.Health", 80).Set("HATE.Attribute.MaxHealth", 120));
+
+// 3. A Trait System (columnar fast path): clamp Health to MaxHealth across every Combat entity.
+world.Lens.RunSystemColumn("HATE.Trait.Combat", "HATE.Attribute.Health", SystemOp.Min, "HATE.Attribute.MaxHealth");
+
+// 4. Effects: define once, apply instantly (or AddEffect for a duration buff + RecomputeAttribute).
+world.DefineEffect("HATE.Effect.Smite", new HateModifier("HATE.Attribute.Health", HateOp.Add, -30));
+world.ApplyInstant(goblin, "HATE.Effect.Smite");      // Health 80 -> 50
+```
+
+In practice you author the schema, effects, abilities and archetypes in `.hate` files and the Toolkit generates
+this code (typed GameplayTag handles + `Schema.BuildWorld()` + `Spawn<Archetype>()`); the above is the hand-written
+shape of what it emits.
