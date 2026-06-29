@@ -35,6 +35,9 @@ namespace Heathen.HATE
         private readonly List<EntityId> _spawned = new List<EntityId>();
         private readonly List<HateDespawn> _despawned = new List<HateDespawn>();
 
+        // Cosmetic cue stream (§15): a presentation system drains it each frame. Never authoritative state.
+        private readonly List<HateCueEvent> _cues = new List<HateCueEvent>();
+
         private readonly Dictionary<ulong, HateTallStore> _tallOf = new Dictionary<ulong, HateTallStore>();        // store id -> tall store
         private readonly Dictionary<ulong, GameplayTag> _entityIndexTag = new Dictionary<ulong, GameplayTag>();    // store id -> EntityIndex col tag
         private readonly Dictionary<ulong, DataLensView> _tallInsertViews = new Dictionary<ulong, DataLensView>(); // store id -> cached insert view
@@ -50,6 +53,10 @@ namespace Heathen.HATE
         private readonly Dictionary<ulong, HateAbilityDef> _abilityDefs = new Dictionary<ulong, HateAbilityDef>();
         private readonly List<(EntityId caster, GameplayTag ability, EntityId target)> _activations
             = new List<(EntityId, GameplayTag, EntityId)>();
+
+        // GrantedTags store (HATE-Spec §7.3): granted tags + immunity, ref-counted (EntityIndex + Tag + RefCount).
+        private bool _hasGrantedTags;
+        private GameplayTag _grantedStore, _grEntityIndexCol, _grTagCol, _grRefCol;
 
         // Engine bridge rendezvous (§14): an opaque ExternalRef u64 column on the catalog.
         private GameplayTag _externalRefCol;
@@ -108,34 +115,59 @@ namespace Heathen.HATE
 
             foreach (HateTallStore tall in schema.TallStores) BuildTall(tall);
 
-            // The dedicated Effects store: HATE owns its schema (EffectTag/Duration/Stacks + EntityIndex).
+            // The dedicated Effects store: one tall store whose width is the reserved machinery columns
+            // (identity + the timer/stacks the tick loop drives, addressed by well-known tag) plus the authored
+            // effect-attribute superset. Every effect row carries every column; an effect leaves the ones it
+            // does not use at default (HATE-Spec §7 - the wide-sparse "all active things share one structure").
             if (schema.HasEffects)
             {
                 _hasEffects = true;
                 _effectsStore = schema.EffectsStore;
-                _effTagCol = EffectColTag(_effectsStore, 1);
-                _effDurationCol = EffectColTag(_effectsStore, 2);
-                _effStacksCol = EffectColTag(_effectsStore, 3);
-                BuildTall(new HateTallStore(_effectsStore, schema.EffectsCapacity,
+                _effTagCol = HateReserved.EffectTag;
+                _effDurationCol = HateReserved.EffectDuration;
+                _effStacksCol = HateReserved.EffectStacks;
+                var cols = new List<HateAttribute>
+                {
                     new HateAttribute(_effTagCol, DataLensValueType.UInt64),
                     new HateAttribute(_effDurationCol, DataLensValueType.Float),
-                    new HateAttribute(_effStacksCol, DataLensValueType.Int32)));
+                    new HateAttribute(_effStacksCol, DataLensValueType.Int32),
+                };
+                AppendUnique(cols, schema.EffectAttributes);
+                BuildTall(new HateTallStore(_effectsStore, schema.EffectsCapacity, cols.ToArray()));
                 _effEntityIndexCol = _entityIndexTag[(ulong)_effectsStore];
             }
 
-            // The dedicated Abilities store (EquippedAbilities): EntityIndex + AbilityTag + Cooldown + Charges.
+            // The dedicated Abilities store: reserved machinery columns (identity + cooldown + charges) plus the
+            // authored ability-attribute superset (DPS, Power, ...), the columns buffs/debuffs operate on.
             if (schema.HasAbilities)
             {
                 _hasAbilities = true;
                 _abilitiesStore = schema.AbilitiesStore;
-                _abTagCol = EffectColTag(_abilitiesStore, 1);
-                _abCooldownCol = EffectColTag(_abilitiesStore, 2);
-                _abChargesCol = EffectColTag(_abilitiesStore, 3);
-                BuildTall(new HateTallStore(_abilitiesStore, schema.AbilitiesCapacity,
+                _abTagCol = HateReserved.AbilityTag;
+                _abCooldownCol = HateReserved.AbilityCooldown;
+                _abChargesCol = HateReserved.AbilityCharges;
+                var cols = new List<HateAttribute>
+                {
                     new HateAttribute(_abTagCol, DataLensValueType.UInt64),
                     new HateAttribute(_abCooldownCol, DataLensValueType.Float),
-                    new HateAttribute(_abChargesCol, DataLensValueType.Int32)));
+                    new HateAttribute(_abChargesCol, DataLensValueType.Int32),
+                };
+                AppendUnique(cols, schema.AbilityAttributes);
+                BuildTall(new HateTallStore(_abilitiesStore, schema.AbilitiesCapacity, cols.ToArray()));
                 _abEntityIndexCol = _entityIndexTag[(ulong)_abilitiesStore];
+            }
+
+            // The dedicated GrantedTags store (granted tags + immunity, §7.3): EntityIndex + Tag + RefCount.
+            if (schema.HasGrantedTags)
+            {
+                _hasGrantedTags = true;
+                _grantedStore = schema.GrantedTagsStore;
+                _grTagCol = EffectColTag(_grantedStore, 1);
+                _grRefCol = EffectColTag(_grantedStore, 2);
+                BuildTall(new HateTallStore(_grantedStore, schema.GrantedTagsCapacity,
+                    new HateAttribute(_grTagCol, DataLensValueType.UInt64),
+                    new HateAttribute(_grRefCol, DataLensValueType.Int32)));
+                _grEntityIndexCol = _entityIndexTag[(ulong)_grantedStore];
             }
 
             _lens = new Lens(_lensSchema);
@@ -245,6 +277,8 @@ namespace Heathen.HATE
             if (vr < 0) return false;
             m.SetState(vr, ViewRowState.Removed);
             m.Commit();
+            ClearTallRowsFor(entity);   // free this entity's effect/ability/granted-tag/tall rows: a reused
+                                        // catalog slot must not inherit stale instance state or immunity
             _despawned.Add(new HateDespawn(entity, externalRef));
             return true;
         }
@@ -282,6 +316,44 @@ namespace Heathen.HATE
             into.AddRange(_despawned);
             _despawned.Clear();
         }
+
+        // ── Gameplay cues (§15) ──────────────────────────────────────────────
+
+        /// <summary>
+        /// Append a cosmetic cue to the stream (HATE-Spec §15). Cues never alter authoritative state; a
+        /// presentation system drains them each frame and maps the tag to VFX/SFX/anim. The Toolkit bridge
+        /// resolves a world location from <paramref name="source"/> (the Foundation stays engine-agnostic).
+        /// </summary>
+        public void RaiseCue(GameplayTag cue, HateCueType type, double magnitude, EntityId source)
+            => _cues.Add(new HateCueEvent(cue, type, magnitude, source));
+
+        /// <summary>Append a sourceless cosmetic cue (source = <see cref="EntityId.None"/>); see the overload
+        /// above. <c>default(EntityId)</c> is catalog row 0, not None, so the default is set explicitly here.</summary>
+        public void RaiseCue(GameplayTag cue, HateCueType type, double magnitude = 0)
+            => _cues.Add(new HateCueEvent(cue, type, magnitude, EntityId.None));
+
+        /// <summary>The cues raised since the last drain (read-only; does not clear the stream).</summary>
+        public IReadOnlyList<HateCueEvent> Cues => _cues;
+
+        /// <summary>Take and clear the cues raised since the last drain (the presentation-system path).</summary>
+        public IReadOnlyList<HateCueEvent> DrainCues()
+        {
+            var copy = _cues.ToArray();
+            _cues.Clear();
+            return copy;
+        }
+
+        /// <summary>Drain the cues into a reusable list (no per-frame allocation - the presentation path).</summary>
+        public void DrainCues(List<HateCueEvent> into)
+        {
+            if (into == null) return;
+            into.Clear();
+            into.AddRange(_cues);
+            _cues.Clear();
+        }
+
+        /// <summary>Discard all queued cues without draining (e.g. a dedicated server that skips presentation).</summary>
+        public void ClearCues() => _cues.Clear();
 
         /// <summary>True if the entity is a live catalog row (a valid, non-despawned handle).</summary>
         public bool IsAlive(EntityId entity)
@@ -342,6 +414,77 @@ namespace Heathen.HATE
             if (filter != null) from.Where(_ => filter);
             return _lens.View(from, select.ToArray());
         }
+
+        // ── Detector → reactor (§9) ──────────────────────────────────────────
+
+        /// <summary>A reaction over one hydrated store row: read/write cells via the view, raise cues, etc.
+        /// If it writes a cell it must mark the row <see cref="ViewRowState.Modified"/> (the reactor commits).</summary>
+        public delegate void ReactRow(DataLensView view, int row);
+
+        /// <summary>A reaction over one hydrated entity (cross-trait) row; the entity is the dereferenced
+        /// catalog row. Write via the view + mark Modified to persist; call <see cref="Despawn"/> to remove.</summary>
+        public delegate void ReactEntityRow(EntityId entity, DataLensView view, int row);
+
+        /// <summary>
+        /// The general detector → reactor over a store (HATE-Spec §9), the assumption-free reactive primitive:
+        /// hydrate just the rows matching <paramref name="filter"/> (the detector - a column predicate, the
+        /// scope keeps the cross-cutting work sparse) and run <paramref name="react"/> on each. The reaction is
+        /// the consumer's - cues, effects, AI, raw game logic, a Wyrd rule - HATE assumes nothing about it.
+        /// With <paramref name="removeMatched"/> the matched rows are freed after reacting (the expire / "on
+        /// exit" pass). Returns the number of rows reacted. Detection is a column predicate here; persist it as
+        /// a flag column via <see cref="Lens"/><c>.RunSystem</c> when other Systems need to read it too.
+        /// </summary>
+        public int React(GameplayTag store, GameplayTag[] columns, DataLensPredicate filter,
+            ReactRow react, bool removeMatched = false)
+        {
+            using (DataLensView v = OpenStoreView(store, columns, filter))
+            {
+                v.Refresh();
+                int n = v.RowCount;
+                for (int i = 0; i < n; i++)
+                {
+                    react?.Invoke(v, i);
+                    if (removeMatched) v.SetState(i, ViewRowState.Removed);
+                }
+                if (n > 0) v.Commit();
+                return n;
+            }
+        }
+
+        /// <summary>
+        /// The general detector → reactor over entities (cross-trait, catalog-based): hydrate just the entities
+        /// matching <paramref name="filter"/> and run <paramref name="react"/> on each, with the resolved
+        /// <see cref="EntityId"/>. The §9 reactor for entity-level edges ("every entity with Health &lt;= 0").
+        /// To remove an entity the reaction calls <see cref="Despawn"/> (so the lifecycle queue + tall-row
+        /// cleanup run); this is why there is no removeMatched here. Returns the number of entities reacted.
+        /// </summary>
+        public int ReactEntities(GameplayTag[] traits, GameplayTag[] attributes, DataLensPredicate filter,
+            ReactEntityRow react)
+        {
+            using (DataLensView v = OpenView(traits, attributes, filter))
+            {
+                v.Refresh();
+                int n = v.RowCount;
+                for (int i = 0; i < n; i++)
+                    react?.Invoke(new EntityId((int)v.SourceRow(i)), v, i);
+                if (n > 0) v.Commit();
+                return n;
+            }
+        }
+
+        /// <summary>
+        /// Advance the age/lifecycle column of a store by one tick (a Trait System pass, HATE-Spec §9). The
+        /// convention: a row inserts at age 0, so <c>age == 0</c> means "entered this tick" (react to it before
+        /// calling this); after the bump it is age &gt;= 1 and no longer fires the entered reactor. Removal is a
+        /// column predicate too (e.g. a timer &lt;= 0), reacted to with <c>removeMatched</c> before the delete.
+        /// Age is an ordinary int column the consumer declares - HATE bakes in no lifecycle assumptions.
+        /// </summary>
+        public void BumpAges(GameplayTag store, GameplayTag ageColumn)
+            => _lens.RunSystem(store, ageColumn, SystemOp.Add, 1);
+
+        /// <summary>The "entered this tick" predicate for an age column (<c>age == 0</c>), per the convention
+        /// above - sugar for <c>new DataLensFilter().Eq(ageColumn, 0)</c>.</summary>
+        public static DataLensPredicate Entered(GameplayTag ageColumn) => new DataLensFilter().Eq(ageColumn, 0);
 
         // ── Tall stores (effects / abilities) ────────────────────────────────
 
@@ -429,6 +572,16 @@ namespace Heathen.HATE
             ulong id = (ulong)store;
             ulong mixed = unchecked(id * 0x9E3779B97F4A7C15UL) ^ 0x456E74497A6E6478UL; // distinct salt from catalog index
             return GameplayTag.FromId(mixed);
+        }
+
+        // Append the authored superset to a store's columns, skipping any tag already present as a reserved
+        // machinery column (so authoring e.g. an explicit "Duration" does not double the timer column).
+        private static void AppendUnique(List<HateAttribute> cols, IReadOnlyList<HateAttribute> extra)
+        {
+            if (extra == null || extra.Count == 0) return;
+            var seen = new HashSet<ulong>();
+            foreach (HateAttribute c in cols) seen.Add((ulong)c.Id);
+            foreach (HateAttribute a in extra) if (seen.Add((ulong)a.Id)) cols.Add(a);
         }
 
         private static GameplayTag EffectColTag(GameplayTag store, int salt)
@@ -727,6 +880,125 @@ namespace Heathen.HATE
             int n = view.RowCount;
             for (int i = 0; i < n; i++)
                 if (view.Get<int>(i, _abEntityIndexCol) == entityIndex && view.Get<ulong>(i, _abTagCol) == abilityTag)
+                    return i;
+            return -1;
+        }
+
+        // ── Granted tags / immunity (§7.3) ───────────────────────────────────
+
+        /// <summary>
+        /// Grant a tag to an entity for as long as it is held (a granted-tags row, ref-counted): a status tag
+        /// (<c>State.Stunned</c>) or an immunity classification. Overlapping grants increment the ref-count so
+        /// the tag survives until every grant is revoked (HATE-Spec §7.3).
+        /// </summary>
+        public void GrantTag(EntityId entity, GameplayTag tag, int count = 1)
+        {
+            if (!_hasGrantedTags) throw new InvalidOperationException("No GrantedTags store declared (HateSchema.WithGrantedTags).");
+            if (count <= 0) return;
+            DataLensView view = GetTallInsertView(_grantedStore);
+            view.Refresh();
+            int existing = FindTagRow(view, entity.Index, (ulong)tag);
+            if (existing >= 0)
+            {
+                view.Set<int>(existing, _grRefCol, view.Get<int>(existing, _grRefCol) + count);
+                view.SetState(existing, ViewRowState.Modified);
+                view.Commit();
+                return;
+            }
+            int r = view.AddRow();
+            view.Set<int>(r, _grEntityIndexCol, entity.Index);
+            view.Set<ulong>(r, _grTagCol, (ulong)tag);
+            view.Set<int>(r, _grRefCol, count);
+            view.SetState(r, ViewRowState.New);
+            view.Commit();
+        }
+
+        /// <summary>
+        /// Revoke a previously granted tag: decrement its ref-count, freeing the row when it reaches zero.
+        /// Returns false if the entity did not hold the tag.
+        /// </summary>
+        public bool RevokeTag(EntityId entity, GameplayTag tag, int count = 1)
+        {
+            if (!_hasGrantedTags || count <= 0) return false;
+            DataLensView view = GetTallInsertView(_grantedStore);
+            view.Refresh();
+            int existing = FindTagRow(view, entity.Index, (ulong)tag);
+            if (existing < 0) return false;
+            int remaining = view.Get<int>(existing, _grRefCol) - count;
+            if (remaining > 0)
+            {
+                view.Set<int>(existing, _grRefCol, remaining);
+                view.SetState(existing, ViewRowState.Modified);
+            }
+            else
+            {
+                view.SetState(existing, ViewRowState.Removed);
+            }
+            view.Commit();
+            return true;
+        }
+
+        /// <summary>True if the entity currently holds the granted tag (ref-count &gt; 0).</summary>
+        public bool HasTag(EntityId entity, GameplayTag tag)
+        {
+            if (!_hasGrantedTags) return false;
+            DataLensView view = GetTallInsertView(_grantedStore);
+            view.Refresh();
+            int r = FindTagRow(view, entity.Index, (ulong)tag);
+            return r >= 0 && view.Get<int>(r, _grRefCol) > 0;
+        }
+
+        /// <summary>True if the entity holds any of the given tags (the immunity overlap test).</summary>
+        public bool HasAnyTag(EntityId entity, params GameplayTag[] tags)
+        {
+            if (!_hasGrantedTags || tags == null || tags.Length == 0) return false;
+            DataLensView view = GetTallInsertView(_grantedStore);
+            view.Refresh();
+            foreach (GameplayTag t in tags)
+            {
+                int r = FindTagRow(view, entity.Index, (ulong)t);
+                if (r >= 0 && view.Get<int>(r, _grRefCol) > 0) return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Apply an effect instantly unless the target is immune (HATE-Spec §7.3): if any of the effect's
+        /// <paramref name="classificationTags"/> overlaps the target's granted tags, the application is blocked.
+        /// Returns true only if the effect was applied; false if it was blocked by immunity or is undefined.
+        /// </summary>
+        public bool TryApplyEffectInstant(EntityId entity, GameplayTag effectTag, params GameplayTag[] classificationTags)
+        {
+            if (HasAnyTag(entity, classificationTags)) return false; // blocked by immunity
+            return ApplyInstant(entity, effectTag);
+        }
+
+        // Free every tall-store row owned by an entity (EntityIndex == its catalog row), across effects,
+        // abilities, granted tags and any user-declared tall stores - all are EntityIndex-keyed. Called on
+        // Despawn so a reused catalog slot never inherits the previous occupant's instance state.
+        private void ClearTallRowsFor(EntityId entity)
+        {
+            foreach (KeyValuePair<ulong, GameplayTag> kv in _entityIndexTag)
+            {
+                DataLensView view = GetTallInsertView(new GameplayTag(kv.Key));
+                view.Refresh();
+                int n = view.RowCount;
+                bool any = false;
+                for (int i = 0; i < n; i++)
+                    if (view.Get<int>(i, kv.Value) == entity.Index)
+                    {
+                        view.SetState(i, ViewRowState.Removed);
+                        any = true;
+                    }
+                if (any) view.Commit();
+            }
+        }
+
+        private int FindTagRow(DataLensView view, int entityIndex, ulong tag)
+        {
+            int n = view.RowCount;
+            for (int i = 0; i < n; i++)
+                if (view.Get<int>(i, _grEntityIndexCol) == entityIndex && view.Get<ulong>(i, _grTagCol) == tag)
                     return i;
             return -1;
         }

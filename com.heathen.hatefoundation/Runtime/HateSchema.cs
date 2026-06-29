@@ -79,10 +79,21 @@ namespace Heathen.HATE
         public IReadOnlyList<HateTrait> Traits { get; }
         public IReadOnlyList<HateTallStore> TallStores => _tallStores;
 
+        private HateAttribute[] _effectAttributes = Array.Empty<HateAttribute>();
+        private HateAttribute[] _abilityAttributes = Array.Empty<HateAttribute>();
+
         /// <summary>Whether a dedicated Effects store was declared (§7).</summary>
         public bool HasEffects { get; private set; }
         public GameplayTag EffectsStore { get; private set; }
         public int EffectsCapacity { get; private set; }
+
+        /// <summary>The authored effect-attribute superset: the columns of the single Effects store, on top of
+        /// the reserved machinery columns (<see cref="HateReserved.EffectDuration"/> etc.). Every effect row
+        /// carries them all; an effect simply leaves the ones it does not use at default (HATE-Spec §7).</summary>
+        public IReadOnlyList<HateAttribute> EffectAttributes => _effectAttributes;
+
+        /// <summary>The authored ability-attribute superset: the columns of the single Abilities store.</summary>
+        public IReadOnlyList<HateAttribute> AbilityAttributes => _abilityAttributes;
 
         public HateSchema(int catalogCapacity, params HateTrait[] traits)
         {
@@ -102,11 +113,12 @@ namespace Heathen.HATE
         /// Duration + Stacks). Enables <see cref="HateWorld.DefineEffect"/>/<c>ApplyInstant</c>/<c>AddEffect</c>/
         /// <c>RecomputeAttribute</c>. Returns this for chaining.
         /// </summary>
-        public HateSchema WithEffects(GameplayTag store, int capacity)
+        public HateSchema WithEffects(GameplayTag store, int capacity, params HateAttribute[] attributes)
         {
             HasEffects = true;
             EffectsStore = store;
             EffectsCapacity = capacity;
+            _effectAttributes = attributes ?? Array.Empty<HateAttribute>();
             return this;
         }
 
@@ -119,11 +131,33 @@ namespace Heathen.HATE
         /// Declare the dedicated Abilities store (EntityIndex + AbilityTag + Cooldown + Charges). Enables
         /// <see cref="HateWorld.GrantAbility"/>/<c>Activate</c>/<c>TickCooldowns</c>. Returns this for chaining.
         /// </summary>
-        public HateSchema WithAbilities(GameplayTag store, int capacity)
+        public HateSchema WithAbilities(GameplayTag store, int capacity, params HateAttribute[] attributes)
         {
             HasAbilities = true;
             AbilitiesStore = store;
             AbilitiesCapacity = capacity;
+            _abilityAttributes = attributes ?? Array.Empty<HateAttribute>();
+            return this;
+        }
+
+        /// <summary>Whether a dedicated GrantedTags store was declared (§7.3).</summary>
+        public bool HasGrantedTags { get; private set; }
+        public GameplayTag GrantedTagsStore { get; private set; }
+        public int GrantedTagsCapacity { get; private set; }
+
+        /// <summary>
+        /// Declare the dedicated GrantedTags store (EntityIndex + Tag + RefCount): the backbone for granted
+        /// tags and immunity (HATE-Spec §7.3). An active effect grants a tag on an entity for its lifetime
+        /// (<c>State.Stunned</c>); immunity is the same primitive read as a gate (an incoming effect whose
+        /// classification tags overlap the target's granted tags is blocked). Ref-counted so overlapping
+        /// grants compose. Enables <see cref="HateWorld.GrantTag"/>/<c>RevokeTag</c>/<c>HasTag</c>/
+        /// <c>HasAnyTag</c>/<c>TryApplyEffectInstant</c>. Returns this for chaining.
+        /// </summary>
+        public HateSchema WithGrantedTags(GameplayTag store, int capacity)
+        {
+            HasGrantedTags = true;
+            GrantedTagsStore = store;
+            GrantedTagsCapacity = capacity;
             return this;
         }
     }
