@@ -5,20 +5,41 @@ namespace Heathen.HATE
 {
     /// <summary>
     /// An ability's static definition (A) (HATE-Spec §8): the effects it applies on activation, its cooldown,
-    /// and an optional resource cost. Cost and cooldown are not special primitives in the full model (Cost = an
-    /// Effect, Cooldown = a Condition); this slice models a simple resource cost + timer to prove the
-    /// grant/cooldown/activate loop. Targeting input schema, charges and Condition-composed gating come later.
+    /// charges, and an optional resource cost. Cost and cooldown are not special primitives in the full model
+    /// (Cost = an Effect, Cooldown = a Condition); this slice models a simple resource cost + timer.
+    /// <para>
+    /// <b>Charges (GAS parity):</b> an ability holds up to <see cref="MaxCharges"/> charges (default 1).
+    /// Activation consumes one charge and, if the recharge timer is idle, starts it; a charge is restored each
+    /// time <see cref="WithCooldown"/> elapses, up to the maximum. So <see cref="Cooldown"/> is the
+    /// <em>per-charge recharge time</em>, and an ability with multiple charges can fire again while others
+    /// recharge. With the default single charge this is exactly the classic cooldown-gated ability.
+    /// </para>
+    /// Targeting input schema and Condition-composed gating come later.
     /// </summary>
     public sealed class HateAbilityDef
     {
         internal double Cooldown;
+        internal int MaxCharges = 1;
+        internal HateTargetMode TargetMode = HateTargetMode.Supplied;
         internal GameplayTag[] Effects = Array.Empty<GameplayTag>();
         internal GameplayTag CostResource;   // default (invalid) = free
         internal double CostAmount;
+        internal HateCondition[] Requirements = Array.Empty<HateCondition>();
+        internal GameplayTag[] CasterEffects = Array.Empty<GameplayTag>();
 
         public HateAbilityDef WithCooldown(double cooldown) { Cooldown = cooldown; return this; }
+        /// <summary>Sets how the ability selects targets (default <see cref="HateTargetMode.Supplied"/>).</summary>
+        public HateAbilityDef WithTargeting(HateTargetMode mode) { TargetMode = mode; return this; }
+        /// <summary>Shorthand for a self-targeted ability (<see cref="HateTargetMode.Caster"/>).</summary>
+        public HateAbilityDef SelfTargeted() { TargetMode = HateTargetMode.Caster; return this; }
+        /// <summary>Sets the maximum charges (clamped to at least 1). The cooldown becomes the per-charge recharge time.</summary>
+        public HateAbilityDef WithCharges(int maxCharges) { MaxCharges = maxCharges < 1 ? 1 : maxCharges; return this; }
         public HateAbilityDef Applies(params GameplayTag[] effects) { Effects = effects ?? Array.Empty<GameplayTag>(); return this; }
         public HateAbilityDef Costs(GameplayTag resource, double amount) { CostResource = resource; CostAmount = amount; return this; }
+        /// <summary>Eligibility conditions (all must hold against the caster) — the Condition half of §8's cost/cooldown model.</summary>
+        public HateAbilityDef Requires(params HateCondition[] conditions) { Requirements = conditions ?? Array.Empty<HateCondition>(); return this; }
+        /// <summary>Effects applied to the <em>caster</em> on activation — the Effect half: consume ammo/resource, stamp a cooldown timer, self-debuff.</summary>
+        public HateAbilityDef AppliesToCaster(params GameplayTag[] effects) { CasterEffects = effects ?? Array.Empty<GameplayTag>(); return this; }
     }
 
     /// <summary>

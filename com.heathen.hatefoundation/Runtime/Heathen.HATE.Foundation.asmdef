@@ -2,6 +2,7 @@
     "name": "Heathen.HATE.Foundation",
     "rootNamespace": "Heathen.HATE",
     "references": [
+        "Heathen.GameFramework",
         "Heathen.DataLens.Foundation",
         "Heathen.GameplayTags"
     ],

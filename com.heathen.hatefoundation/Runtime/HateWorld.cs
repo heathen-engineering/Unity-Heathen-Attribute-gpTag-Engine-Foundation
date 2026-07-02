@@ -51,8 +51,8 @@ namespace Heathen.HATE
         private bool _hasAbilities;
         private GameplayTag _abilitiesStore, _abEntityIndexCol, _abTagCol, _abCooldownCol, _abChargesCol;
         private readonly Dictionary<ulong, HateAbilityDef> _abilityDefs = new Dictionary<ulong, HateAbilityDef>();
-        private readonly List<(EntityId caster, GameplayTag ability, EntityId target)> _activations
-            = new List<(EntityId, GameplayTag, EntityId)>();
+        private readonly List<(EntityId caster, GameplayTag ability, HateTargetInput input)> _activations
+            = new List<(EntityId, GameplayTag, HateTargetInput)>();
 
         // GrantedTags store (HATE-Spec §7.3): granted tags + immunity, ref-counted (EntityIndex + Tag + RefCount).
         private bool _hasGrantedTags;
@@ -202,6 +202,45 @@ namespace Heathen.HATE
             var id = new EntityId((int)catalogRow);
             _spawned.Add(id);                     // polled "needs-visual" queue (§14)
             return id;
+        }
+
+        /// <summary>
+        /// Batch-spawn <paramref name="count"/> entities of one archetype in a single insert — one view refresh
+        /// and one commit for the whole batch, instead of the per-spawn O(live) re-hydrate that
+        /// <see cref="Spawn(HateArchetype)"/> pays. This is the O(n) path for populating a world at scale
+        /// (spawning 100k entities individually is O(n²)). Every entity gets the archetype's default values;
+        /// vary them afterwards with a columnar Trait System (e.g. noise, see <see cref="RunTraitSystem(GameplayTag,GameplayTag,SystemOp,double)"/>)
+        /// rather than per-entity writes, which are themselves O(live).
+        /// </summary>
+        public EntityId[] Spawn(HateArchetype archetype, int count)
+        {
+            if (archetype == null) throw new ArgumentNullException(nameof(archetype));
+            if (count <= 0) return Array.Empty<EntityId>();
+
+            DataLensView view = GetSpawnView(archetype.Traits);
+            view.Refresh();                       // once for the whole batch (not per row)
+
+            var rows = new int[count];
+            for (int i = 0; i < count; i++)
+            {
+                int r = view.AddRow();
+                foreach (KeyValuePair<ulong, double> v in archetype.Values)
+                    if (_attrType.TryGetValue(v.Key, out DataLensValueType t))
+                        SetTyped(view, r, new GameplayTag(v.Key), t, v.Value);
+                view.SetState(r, ViewRowState.New);
+                rows[i] = r;
+            }
+            view.Commit();                        // once — the linked batch insert
+
+            var ids = new EntityId[count];
+            for (int i = 0; i < count; i++)
+            {
+                long catalogRow = view.SourceRow(rows[i]);
+                if (catalogRow < 0) { ids[i] = EntityId.None; continue; }
+                ids[i] = new EntityId((int)catalogRow);
+                _spawned.Add(ids[i]);
+            }
+            return ids;
         }
 
         private DataLensView GetSpawnView(IReadOnlyList<GameplayTag> traits)
@@ -486,6 +525,29 @@ namespace Heathen.HATE
         /// above - sugar for <c>new DataLensFilter().Eq(ageColumn, 0)</c>.</summary>
         public static DataLensPredicate Entered(GameplayTag ageColumn) => new DataLensFilter().Eq(ageColumn, 0);
 
+        /// <summary>
+        /// Run a Trait System over a trait's per-entity store (HATE-Spec §6.1): a single branchless columnar
+        /// pass applying <paramref name="op"/> with a scalar <paramref name="operand"/> to every row's
+        /// <paramref name="column"/> (e.g. regen <c>Mana += rate</c>, decay, a flat tick). This is the fast path
+        /// that scales to 100k+ entities; the store is addressed by the trait tag.
+        /// </summary>
+        public void RunTraitSystem(GameplayTag trait, GameplayTag column, SystemOp op, double operand)
+        {
+            if (!_traitOf.ContainsKey((ulong)trait)) throw new ArgumentException($"Unknown trait {(ulong)trait}.");
+            _lens.RunSystem(trait, column, op, operand);
+        }
+
+        /// <summary>
+        /// Run a cross-column Trait System over a trait's store: apply <paramref name="op"/> to
+        /// <paramref name="targetColumn"/> using each row's <paramref name="operandColumn"/> as the operand (e.g.
+        /// <c>Health += Regen</c>, or clamp <c>Health = Min(Health, MaxHealth)</c> with <see cref="SystemOp.Min"/>).
+        /// </summary>
+        public void RunTraitSystem(GameplayTag trait, GameplayTag targetColumn, SystemOp op, GameplayTag operandColumn)
+        {
+            if (!_traitOf.ContainsKey((ulong)trait)) throw new ArgumentException($"Unknown trait {(ulong)trait}.");
+            _lens.RunSystemColumn(trait, targetColumn, op, operandColumn);
+        }
+
         // ── Tall stores (effects / abilities) ────────────────────────────────
 
         /// <summary>The synthesised EntityIndex column tag of a tall store (scope on it: WHERE EntityIndex == N).</summary>
@@ -648,6 +710,64 @@ namespace Heathen.HATE
         /// <summary>Number of active effect rows on an entity.</summary>
         public int CountEffects(EntityId entity) => _hasEffects ? CountFor(_effectsStore, entity) : 0;
 
+        // ── Effect types (§7.4) ──────────────────────────────────────────────
+        // A type is a tag-hierarchy position (HATE.Effect.DOT.Poison under HATE.Effect.DOT), so gameplay
+        // addresses effects by subtree, never by store. Whether the store is monolithic (one wide store,
+        // matched by tag) or split per type is a codegen knob (§7.4); these type-ops work either way. Match is
+        // the interval-encoded O(1) hierarchy test (§12.1) — the type tags must be registered for it to resolve.
+
+        /// <summary>Count the effects on an entity whose tag is the given type or a descendant of it
+        /// (e.g. all DOTs under <c>HATE.Effect.DOT</c>).</summary>
+        public int CountEffectsOfType(EntityId entity, GameplayTag typeSubtree)
+        {
+            if (!_hasEffects) return 0;
+            using (DataLensView v = OpenStoreView(_effectsStore, new[] { _effEntityIndexCol, _effTagCol },
+                new DataLensFilter().Eq(_effEntityIndexCol, entity.Index)))
+            {
+                v.Refresh();
+                int count = 0, n = v.RowCount;
+                for (int i = 0; i < n; i++)
+                    if (IsAtOrUnder(v.Get<ulong>(i, _effTagCol), typeSubtree)) count++;
+                return count;
+            }
+        }
+
+        /// <summary>True if the entity has any effect of the given type (or a descendant).</summary>
+        public bool HasEffectOfType(EntityId entity, GameplayTag typeSubtree)
+            => CountEffectsOfType(entity, typeSubtree) > 0;
+
+        /// <summary>
+        /// A type-op (§7.4): remove up to <paramref name="max"/> effects on an entity whose tag is the given type
+        /// or a descendant — cleanse / dispel (e.g. "cleanse 1 random DOT" = <c>RemoveEffectsOfType(e, DOT, 1)</c>).
+        /// <paramref name="max"/> &lt; 0 removes all matches. Returns the number removed. As with <see cref="Expire"/>,
+        /// recompute affected attributes afterwards to revert the removed effects' contributions.
+        /// </summary>
+        public int RemoveEffectsOfType(EntityId entity, GameplayTag typeSubtree, int max = -1)
+        {
+            if (!_hasEffects || max == 0) return 0;
+            using (DataLensView v = OpenStoreView(_effectsStore, new[] { _effEntityIndexCol, _effTagCol },
+                new DataLensFilter().Eq(_effEntityIndexCol, entity.Index)))
+            {
+                v.Refresh();
+                int removed = 0, n = v.RowCount;
+                for (int i = 0; i < n; i++)
+                {
+                    if (!IsAtOrUnder(v.Get<ulong>(i, _effTagCol), typeSubtree)) continue;
+                    v.SetState(i, ViewRowState.Removed);
+                    if (++removed == max) break;
+                }
+                if (removed > 0) v.Commit();
+                return removed;
+            }
+        }
+
+        // "at or under": the effect's own tag matches the type node, or is a registered descendant of it.
+        private static bool IsAtOrUnder(ulong effectTagId, GameplayTag typeSubtree)
+        {
+            var tag = new GameplayTag(effectTagId);
+            return tag.Equals(typeSubtree) || tag.IsChildOf(typeSubtree);
+        }
+
         /// <summary>
         /// Tick all effect timers down by <paramref name="dt"/> (a Trait System column pass) and delete those
         /// that reach zero (an Entity System View Delete). Recompute attributes afterwards to revert expired
@@ -799,10 +919,16 @@ namespace Heathen.HATE
         public void DefineAbility(GameplayTag abilityTag, HateAbilityDef def)
             => _abilityDefs[(ulong)abilityTag] = def ?? throw new ArgumentNullException(nameof(def));
 
-        /// <summary>Grant an ability to an entity (insert an EquippedAbilities row); no-op if already granted.</summary>
-        public void GrantAbility(EntityId entity, GameplayTag abilityTag, int charges = 1)
+        /// <summary>
+        /// Grant an ability to an entity (insert an EquippedAbilities row); no-op if already granted.
+        /// <paramref name="charges"/> &lt; 0 (the default) grants the ability at full charges (its
+        /// <see cref="HateAbilityDef.MaxCharges"/>, or 1 if no definition is registered).
+        /// </summary>
+        public void GrantAbility(EntityId entity, GameplayTag abilityTag, int charges = -1)
         {
             if (!_hasAbilities) throw new InvalidOperationException("No Abilities store declared (HateSchema.WithAbilities).");
+            if (charges < 0)
+                charges = _abilityDefs.TryGetValue((ulong)abilityTag, out HateAbilityDef def) ? def.MaxCharges : 1;
             DataLensView view = GetTallInsertView(_abilitiesStore);
             view.Refresh();
             if (FindAbilityRow(view, entity.Index, (ulong)abilityTag) >= 0) return;
@@ -824,23 +950,63 @@ namespace Heathen.HATE
             return FindAbilityRow(view, entity.Index, (ulong)abilityTag) >= 0;
         }
 
-        /// <summary>Tick every ability cooldown down by dt and clamp at zero (a Trait System column pass).</summary>
+        /// <summary>
+        /// Advance ability recharge by dt: decrement every recharge timer (a columnar Trait System pass, clamped
+        /// at zero), then restore a charge to each ability whose timer just elapsed and is below its maximum,
+        /// restarting the timer while charges remain to refill.
+        /// </summary>
         public void TickCooldowns(double dt)
         {
             if (!_hasAbilities) return;
             _lens.RunSystem(_abilitiesStore, _abCooldownCol, SystemOp.Sub, dt);
             _lens.RunSystem(_abilitiesStore, _abCooldownCol, SystemOp.Max, 0);
+            RechargeAbilities();
         }
 
-        /// <summary>Activate an ability on the caster itself.</summary>
-        public bool Activate(EntityId caster, GameplayTag abilityTag) => Activate(caster, abilityTag, caster);
+        // Managed pass: an elapsed timer (cooldown <= 0) on a below-max stack restores one charge; if still
+        // below max, the timer restarts to refill the next. Per-ability max/recharge come from the def (by tag),
+        // so this cannot be a pure columnar op. Only acts on rows that just elapsed, so idle/full rows are skipped.
+        private void RechargeAbilities()
+        {
+            DataLensView view = GetTallInsertView(_abilitiesStore);
+            view.Refresh();
+            int n = view.RowCount;
+            bool dirty = false;
+            for (int i = 0; i < n; i++)
+            {
+                if (view.Get<float>(i, _abCooldownCol) > 0f) continue;            // still recharging
+                if (!_abilityDefs.TryGetValue(view.Get<ulong>(i, _abTagCol), out HateAbilityDef def)) continue;
+                int charges = view.Get<int>(i, _abChargesCol);
+                if (charges >= def.MaxCharges) continue;                          // full (or no def)
+
+                charges++;
+                view.Set<int>(i, _abChargesCol, charges);
+                if (charges < def.MaxCharges)
+                    view.Set<float>(i, _abCooldownCol, (float)def.Cooldown);      // refill the next charge
+                view.SetState(i, ViewRowState.Modified);
+                dirty = true;
+            }
+            if (dirty) view.Commit();
+        }
+
+        /// <summary>Activate an ability with no supplied targets — hits the ability's mode-resolved set
+        /// (the caster for a self-targeted ability, else the caster as the default supplied target).</summary>
+        public bool Activate(EntityId caster, GameplayTag abilityTag)
+            => Activate(caster, abilityTag, default(HateTargetInput));
+
+        /// <summary>Activate an ability against a single supplied target (a <see cref="HateTargetMode.Supplied"/>
+        /// ability applies to it; a <see cref="HateTargetMode.Caster"/> ability ignores it and hits the caster).</summary>
+        public bool Activate(EntityId caster, GameplayTag abilityTag, EntityId target)
+            => Activate(caster, abilityTag, HateTargetInput.Of(target));
 
         /// <summary>
-        /// Activate an ability on a target: gated by grant + cooldown + (optional) resource cost. On success it
-        /// pays the cost, applies the ability's effects to the target, and starts the cooldown. The resolver
-        /// (§8); targeting input schema is the game's, here the target is supplied.
+        /// Activate an ability with the full invocation input (HATE-Spec §8). Gated once by grant + charges +
+        /// (optional) resource cost; on success it consumes a charge, pays the cost, resolves the target set from
+        /// the ability's <see cref="HateAbilityDef.TargetMode"/> + the supplied input, and applies the ability's
+        /// effects to every resolved target. The point/params on <paramref name="input"/> are carried, not
+        /// interpreted — game resolver systems read them.
         /// </summary>
-        public bool Activate(EntityId caster, GameplayTag abilityTag, EntityId target)
+        public bool Activate(EntityId caster, GameplayTag abilityTag, HateTargetInput input)
         {
             if (!_hasAbilities || !_abilityDefs.TryGetValue((ulong)abilityTag, out HateAbilityDef def)) return false;
 
@@ -848,29 +1014,81 @@ namespace Heathen.HATE
             view.Refresh();
             int row = FindAbilityRow(view, caster.Index, (ulong)abilityTag);
             if (row < 0) return false;                                   // not granted
-            if (view.Get<float>(row, _abCooldownCol) > 0f) return false;  // on cooldown
+            if (view.Get<int>(row, _abChargesCol) < 1) return false;      // no charges available
             if (def.CostResource.IsValid && GetAttribute(caster, def.CostResource) < def.CostAmount) return false; // unaffordable
+            for (int i = 0; i < def.Requirements.Length; i++)             // eligibility Conditions (§8): all must hold
+                if (!CasterMeets(caster, def.Requirements[i])) return false;
 
-            view.Set<float>(row, _abCooldownCol, (float)def.Cooldown);    // start cooldown (abilities store)
+            // Consume a charge. Start the recharge timer only if it is idle (a charge just left a full stack);
+            // an in-flight recharge keeps running, so remaining charges fire while the stack refills.
+            int remaining = view.Get<int>(row, _abChargesCol) - 1;
+            view.Set<int>(row, _abChargesCol, remaining);
+            if (view.Get<float>(row, _abCooldownCol) <= 0f && remaining < def.MaxCharges)
+                view.Set<float>(row, _abCooldownCol, (float)def.Cooldown);
             view.SetState(row, ViewRowState.Modified);
             view.Commit();
 
             if (def.CostResource.IsValid)
                 SetAttribute(caster, def.CostResource, GetAttribute(caster, def.CostResource) - def.CostAmount);
-            foreach (GameplayTag e in def.Effects) ApplyInstant(target, e);
+
+            // Cost effects (§8): consume ammo/resource, stamp a cooldown timer, self-debuff — applied to the
+            // caster once per activation.
+            foreach (GameplayTag e in def.CasterEffects) ApplyInstant(caster, e);
+
+            // Targeting (HATE mechanism): apply the effects to every resolved target. Cost + charge are paid once
+            // per activation, not per target.
+            foreach (EntityId t in ResolveTargets(caster, def.TargetMode, input))
+                foreach (GameplayTag e in def.Effects)
+                    ApplyInstant(t, e);
             return true;
         }
 
-        /// <summary>Queue an activation request (the §8 AbilityActivationRequest), drained by <see cref="DrainActivations"/>.</summary>
+        // Evaluates one eligibility condition against an entity: an attribute comparison or a granted-tag test.
+        private bool CasterMeets(EntityId entity, HateCondition c)
+        {
+            switch (c.kind)
+            {
+                case HateCondition.Kind.HasTag:   return HasTag(entity, c.tag);
+                case HateCondition.Kind.LacksTag: return !HasTag(entity, c.tag);
+                default:                          return Compare(GetAttribute(entity, c.tag), c.op, c.value);
+            }
+        }
+
+        private static bool Compare(double a, CompareOp op, double b) => op switch
+        {
+            CompareOp.Always       => true,
+            CompareOp.Equal        => a == b,
+            CompareOp.NotEqual     => a != b,
+            CompareOp.Less         => a < b,
+            CompareOp.LessEqual    => a <= b,
+            CompareOp.Greater      => a > b,
+            CompareOp.GreaterEqual => a >= b,
+            _                      => true, // bitmask ops are not meaningful for a scalar eligibility check
+        };
+
+        // Resolves the target set: Caster mode = the caster; Supplied mode = the supplied list, defaulting to the
+        // caster when none were supplied (so Activate(caster, ability) self-casts a plain supplied ability).
+        private static IEnumerable<EntityId> ResolveTargets(EntityId caster, HateTargetMode mode, HateTargetInput input)
+        {
+            if (mode == HateTargetMode.Caster || input.Targets == null || input.Targets.Length == 0)
+                return new[] { caster };
+            return input.Targets;
+        }
+
+        /// <summary>Queue a single-target activation request (the §8 AbilityActivationRequest), drained by <see cref="DrainActivations"/>.</summary>
         public void RequestActivation(EntityId caster, GameplayTag abilityTag, EntityId target)
-            => _activations.Add((caster, abilityTag, target));
+            => _activations.Add((caster, abilityTag, HateTargetInput.Of(target)));
+
+        /// <summary>Queue an activation request carrying the full invocation input, drained by <see cref="DrainActivations"/>.</summary>
+        public void RequestActivation(EntityId caster, GameplayTag abilityTag, HateTargetInput input)
+            => _activations.Add((caster, abilityTag, input));
 
         /// <summary>Process all queued activation requests (the one dispatch Entity System). Returns successes.</summary>
         public int DrainActivations()
         {
             int ok = 0;
             for (int i = 0; i < _activations.Count; i++)
-                if (Activate(_activations[i].caster, _activations[i].ability, _activations[i].target)) ok++;
+                if (Activate(_activations[i].caster, _activations[i].ability, _activations[i].input)) ok++;
             _activations.Clear();
             return ok;
         }
