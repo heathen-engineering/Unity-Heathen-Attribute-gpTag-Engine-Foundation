@@ -15,7 +15,7 @@ namespace Heathen.HATE
     /// <para>This is slice 1 (schema + catalog + trait stores + spawn/despawn/attributes). Tall stores
     /// (effects/abilities), Trait/Entity Systems and resolution arrive in later slices.</para>
     /// </summary>
-    public sealed class HateWorld : IDisposable
+    public sealed partial class HateWorld : IDisposable
     {
         private readonly HateSchema _schema;
         private readonly DataLensSchema _lensSchema;
@@ -1015,9 +1015,17 @@ namespace Heathen.HATE
             int row = FindAbilityRow(view, caster.Index, (ulong)abilityTag);
             if (row < 0) return false;                                   // not granted
             if (view.Get<int>(row, _abChargesCol) < 1) return false;      // no charges available
-            if (def.CostResource.IsValid && GetAttribute(caster, def.CostResource) < def.CostAmount) return false; // unaffordable
-            for (int i = 0; i < def.Requirements.Length; i++)             // eligibility Conditions (§8): all must hold
-                if (!CasterMeets(caster, def.Requirements[i])) return false;
+            // Resolve who pays the cost (§8.1). Default source mode is the caster, so a plain ability is unchanged.
+            EntityId[] sources = ResolveSources(caster, def.SourceMode, input);
+
+            // Eligibility + affordability are checked over EVERY source before anything is consumed: if any source
+            // cannot afford the resource cost or fails a requirement, the whole activation fails atomically.
+            for (int s = 0; s < sources.Length; s++)
+            {
+                if (def.CostResource.IsValid && GetAttribute(sources[s], def.CostResource) < def.CostAmount) return false; // unaffordable
+                for (int i = 0; i < def.Requirements.Length; i++)         // eligibility Conditions (§8): all must hold
+                    if (!CasterMeets(sources[s], def.Requirements[i])) return false;
+            }
 
             // Consume a charge. Start the recharge timer only if it is idle (a charge just left a full stack);
             // an in-flight recharge keeps running, so remaining charges fire while the stack refills.
@@ -1028,15 +1036,17 @@ namespace Heathen.HATE
             view.SetState(row, ViewRowState.Modified);
             view.Commit();
 
-            if (def.CostResource.IsValid)
-                SetAttribute(caster, def.CostResource, GetAttribute(caster, def.CostResource) - def.CostAmount);
+            // Pay the cost from each source (§8.1): resource deduction + cost effects (consume ammo/resource, stamp
+            // a cooldown timer, self-debuff, or drain a sacrificed source). Default caster source = the old behaviour.
+            for (int s = 0; s < sources.Length; s++)
+            {
+                if (def.CostResource.IsValid)
+                    SetAttribute(sources[s], def.CostResource, GetAttribute(sources[s], def.CostResource) - def.CostAmount);
+                foreach (GameplayTag e in def.SourceEffects) ApplyInstant(sources[s], e);
+            }
 
-            // Cost effects (§8): consume ammo/resource, stamp a cooldown timer, self-debuff — applied to the
-            // caster once per activation.
-            foreach (GameplayTag e in def.CasterEffects) ApplyInstant(caster, e);
-
-            // Targeting (HATE mechanism): apply the effects to every resolved target. Cost + charge are paid once
-            // per activation, not per target.
+            // Targeting (HATE mechanism): apply the result effects to every resolved target. Cost + charge are paid
+            // once per activation, not per target.
             foreach (EntityId t in ResolveTargets(caster, def.TargetMode, input))
                 foreach (GameplayTag e in def.Effects)
                     ApplyInstant(t, e);
@@ -1073,6 +1083,15 @@ namespace Heathen.HATE
             if (mode == HateTargetMode.Caster || input.Targets == null || input.Targets.Length == 0)
                 return new[] { caster };
             return input.Targets;
+        }
+
+        // Resolves the source set / cost-payers (§8.1): Caster mode = the caster; Supplied mode = the supplied
+        // source list, defaulting to the caster when none were supplied.
+        private static EntityId[] ResolveSources(EntityId caster, HateSourceMode mode, HateTargetInput input)
+        {
+            if (mode == HateSourceMode.Caster || input.Sources == null || input.Sources.Length == 0)
+                return new[] { caster };
+            return input.Sources;
         }
 
         /// <summary>Queue a single-target activation request (the §8 AbilityActivationRequest), drained by <see cref="DrainActivations"/>.</summary>
