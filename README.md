@@ -25,13 +25,33 @@ Learn more or explore other ways to support @ [heathen.group/kb](https://heathen
 
 -----
 
-## Status: runtime built on DataLens
+## Status: feature-complete runtime + authoring, on the Game Framework
 
-> The runtime is **built and working** as a pure DataLens consumer — HATE owns no storage; it declares a
-> DataLens schema and rides the Lens (entities, traits, effects, abilities, the engine bridge, and the
-> authoring → codegen pipeline). Verified end-to-end against the native library and in the Unity Test Runner.
-> The HATE Forge authoring window and a few GAS extras (cues, immunity, ability charges/targeting, prediction)
-> are the remaining items.
+> The runtime is **built, verified, and feature-complete for GAS parity** as a pure DataLens consumer — HATE
+> owns no storage; it declares a DataLens schema and rides the Lens. Verified end-to-end against the native
+> library and in the Unity Test Runner, and homed in a Game Framework **World** via `HateWorldSubsystem`
+> (fixed-step auto-tick + a composition hook).
+
+**Built and verified:**
+- **Entities, traits, effects, abilities** — attributes (typed + ranged), effects with GAS aggregation
+  (`Current = override ?? (Base + ΣAdd)·ΠMul`), stacking, reapply policy, immunity, granted tags/abilities,
+  magnitude/execution calcs; abilities with charges, a targeting input schema, source & target **selectors**,
+  and Condition-composed cost/cooldown. **Gameplay cues** (cosmetic event stream). **Effect type-stores** (§7.4):
+  tag-subtree type-ops on the monolithic store **and** the optional per-type schema-split (a codegen knob).
+- **HATE Forge** authoring window (forms-over-`.hate`-JSON, live validation, undo/redo, a shared **Build**
+  status button) + the **codegen** pipeline (typed GameplayTag handles, `Schema.BuildSchema()`, effect
+  type-split, and **engine-side accessors**: typed `DataView` records + an OOP-membrane `I<Trait>` /
+  `<Trait>Accessor` per trait). Staleness is emitter-version-aware.
+- **Per-entity runtime debugger** (`HateWorld.Inspect` + the HATE Debugger window).
+- **Networking exposure** — HATE opens no socket and implements no authority/prediction; it *exposes* what a
+  netcode stack needs (`ReplicatedStores` + `CollectEntityScope`) on top of DataLens' Snapshot/CollectDelta/
+  ApplyPayload. Replication is the provider's job (Mirror/NGO/FishNet/Unreal), via these hooks.
+- **100k+ entities** under active effects simulate as branchless column passes with zero per-effect GC.
+
+**Remaining:** the `<Archetype>.Spawn(...)` factory + optional ready-made `<Trait>Behaviour` component and the
+ECS (DOTS/O3DE) accessor branch; a "playable" onboarding sample; reference netcode provider adapters (external
+samples); a few perf wins (O(1) single-entity access, insert-without-hydrate). Utility AI is **Wyrd's** concern
+(a later product), not HATE's: HATE is deterministic, Wyrd chooses.
 
 The authoritative design + implementation status live in the SourceRepo at `Assets/Toolkits/DesignSpecs/`:
 - **`HATE-Spec.md`** — the runtime/product spec (the model summarised here).
@@ -56,9 +76,6 @@ authoring concepts, all GameplayTag-addressed and project-wide:
   DataLens batch predicates, with interval-encoded hierarchical tag matching.
 - **Resolution** — effects carry a tag→value payload + context; an Entity System resolves them through a
   Targetable buffer (mitigation, redirect, contextual scaling), with seeded, reproducible RNG.
-
-100k+ entities under active effects simulate as branchless column passes with zero per-effect GC objects.
-Utility AI is **Wyrd's** concern (a later product), not HATE's: HATE is deterministic, Wyrd chooses.
 
 ## Requirements
 
@@ -99,5 +116,5 @@ world.ApplyInstant(goblin, "HATE.Effect.Smite");      // Health 80 -> 50
 ```
 
 In practice you author the schema, effects, abilities and archetypes in `.hate` files and the Toolkit generates
-this code (typed GameplayTag handles + `Schema.BuildWorld()` + `Spawn<Archetype>()`); the above is the hand-written
-shape of what it emits.
+this code (typed GameplayTag handles + `Schema.BuildSchema()` + the per-trait `Views` / `<Trait>Accessor` engine
+bridge); the above is the hand-written shape of what it emits.

@@ -66,6 +66,27 @@ namespace Heathen.HATE
     }
 
     /// <summary>
+    /// A type-split effect store (HATE-Spec §7.4): a tag subtree (e.g. <c>HATE.Effect.DOT</c>) whose effects live
+    /// in their own narrow-dense store rather than the monolithic Effects store. Its columns are the reserved
+    /// machinery (EntityIndex + EffectTag + Duration + Stacks) plus only the attributes this type uses.
+    /// </summary>
+    public sealed class HateEffectType
+    {
+        public GameplayTag Subtree { get; }
+        public GameplayTag Store { get; }
+        public int Capacity { get; }
+        public IReadOnlyList<HateAttribute> Attributes { get; }
+
+        public HateEffectType(GameplayTag subtree, GameplayTag store, int capacity, params HateAttribute[] attributes)
+        {
+            Subtree = subtree;
+            Store = store;
+            Capacity = capacity;
+            Attributes = attributes ?? Array.Empty<HateAttribute>();
+        }
+    }
+
+    /// <summary>
     /// The whole-world declaration: the traits, optional tall stores (effects/abilities), and the EntityCatalog
     /// capacity (max entities). HATE turns this into a <see cref="DataLensSchema"/> (a catalog store with one
     /// dereference index column per trait, a store per trait, and each tall store with its EntityIndex column)
@@ -119,6 +140,28 @@ namespace Heathen.HATE
             EffectsStore = store;
             EffectsCapacity = capacity;
             _effectAttributes = attributes ?? Array.Empty<HateAttribute>();
+            return this;
+        }
+
+        private HateEffectType[] _effectTypes = Array.Empty<HateEffectType>();
+
+        /// <summary>The declared type-split effect stores (§7.4); empty = the single monolithic Effects store.</summary>
+        public IReadOnlyList<HateEffectType> EffectTypes => _effectTypes;
+
+        /// <summary>
+        /// Split a class of effects (a tag subtree, e.g. <c>HATE.Effect.DOT</c>) into its own narrow-dense store
+        /// instead of the monolithic <see cref="WithEffects"/> store (HATE-Spec §7.4). Effects whose tag is that
+        /// subtree or a descendant route to this store; all others stay in the monolithic store. Its columns are
+        /// the reserved machinery (EntityIndex + EffectTag + Duration + Stacks) plus the <paramref name="attributes"/>
+        /// this type uses, so the store is dense. Type-ops, ticking and recompute span every effect store
+        /// automatically; the only cost is that "all effects on this entity" becomes a gather across stores.
+        /// Declare more specific subtrees first when they nest (first at-or-under match wins). Requires
+        /// <see cref="WithEffects"/>. Returns this for chaining.
+        /// </summary>
+        public HateSchema WithEffectType(GameplayTag subtree, GameplayTag store, int capacity, params HateAttribute[] attributes)
+        {
+            var list = new List<HateEffectType>(_effectTypes) { new HateEffectType(subtree, store, capacity, attributes) };
+            _effectTypes = list.ToArray();
             return this;
         }
 

@@ -117,19 +117,23 @@ namespace Heathen.HATE
 
         private HateEffectReading[] ReadEffects(EntityId entity)
         {
-            using (DataLensView v = OpenStoreView(_effectsStore,
-                       new[] { _effEntityIndexCol, _effTagCol, _effDurationCol, _effStacksCol },
-                       new DataLensFilter().Eq(_effEntityIndexCol, entity.Index)))
+            var res = new List<HateEffectReading>();
+            foreach (GameplayTag store in _effectStores) // monolithic + type-split stores (§7.4)
             {
-                v.Refresh();
-                var res = new HateEffectReading[v.RowCount];
-                for (int i = 0; i < res.Length; i++)
-                    res[i] = new HateEffectReading(
-                        new GameplayTag(v.Get<ulong>(i, _effTagCol)),
-                        v.Get<float>(i, _effDurationCol),
-                        v.Get<int>(i, _effStacksCol));
-                return res;
+                EffCols c = _effCols[(ulong)store];
+                using (DataLensView v = OpenStoreView(store,
+                           new[] { c.Ei, c.Tag, c.Duration, c.Stacks },
+                           new DataLensFilter().Eq(c.Ei, entity.Index)))
+                {
+                    v.Refresh();
+                    for (int i = 0; i < v.RowCount; i++)
+                        res.Add(new HateEffectReading(
+                            new GameplayTag(v.Get<ulong>(i, c.Tag)),
+                            v.Get<float>(i, c.Duration),
+                            v.Get<int>(i, c.Stacks)));
+                }
             }
+            return res.ToArray();
         }
 
         private HateAbilityReading[] ReadAbilities(EntityId entity)

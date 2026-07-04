@@ -44,7 +44,21 @@ namespace Heathen.HATE
 
         // Effects store (HATE-Spec §7): the dedicated tall store HATE owns the schema of, + the effect-def table.
         private bool _hasEffects;
-        private GameplayTag _effectsStore, _effEntityIndexCol, _effTagCol, _effDurationCol, _effStacksCol;
+        private GameplayTag _effectsStore, _effTagCol, _effDurationCol, _effStacksCol;
+        private readonly List<GameplayTag> _effectStores = new List<GameplayTag>();                 // monolithic + type-split stores (§7.4)
+        private readonly List<(GameplayTag subtree, GameplayTag store)> _effectRoutes = new List<(GameplayTag, GameplayTag)>();
+
+        // Per-store reserved effect columns. DataLens column tags are globally unique, so each effect store gets
+        // its own EntityIndex/EffectTag/Duration/Stacks tags (the monolithic store keeps the named HateReserved
+        // tags; split stores synthesise unique ones, like EntityIndexTagFor). Gameplay is unaffected: it addresses
+        // effects by the identity VALUE stored in the Tag column, never by the column tag.
+        private readonly struct EffCols
+        {
+            public readonly GameplayTag Ei, Tag, Duration, Stacks;
+            public EffCols(GameplayTag ei, GameplayTag tag, GameplayTag duration, GameplayTag stacks)
+            { Ei = ei; Tag = tag; Duration = duration; Stacks = stacks; }
+        }
+        private readonly Dictionary<ulong, EffCols> _effCols = new Dictionary<ulong, EffCols>();
         private readonly Dictionary<ulong, HateModifier[]> _effectDefs = new Dictionary<ulong, HateModifier[]>();
 
         // Abilities store (HATE-Spec §8) + the ability-def table + the activation request queue.
@@ -134,7 +148,28 @@ namespace Heathen.HATE
                 };
                 AppendUnique(cols, schema.EffectAttributes);
                 BuildTall(new HateTallStore(_effectsStore, schema.EffectsCapacity, cols.ToArray()));
-                _effEntityIndexCol = _entityIndexTag[(ulong)_effectsStore];
+                _effectStores.Add(_effectsStore); // the monolithic store is the catch-all
+                _effCols[(ulong)_effectsStore] = new EffCols(_entityIndexTag[(ulong)_effectsStore], _effTagCol, _effDurationCol, _effStacksCol);
+
+                // Type-split stores (§7.4): each declared tag subtree gets its own narrow-dense store with its OWN
+                // (globally-unique) reserved column tags; effects route to it by tag (see EffectStoreFor).
+                foreach (HateEffectType et in schema.EffectTypes)
+                {
+                    GameplayTag tTag = EffReservedFor(et.Store, 0x4546464147544147UL);
+                    GameplayTag tDur = EffReservedFor(et.Store, 0x4546464455524154UL);
+                    GameplayTag tStk = EffReservedFor(et.Store, 0x4546465354414353UL);
+                    var typeCols = new List<HateAttribute>
+                    {
+                        new HateAttribute(tTag, DataLensValueType.UInt64),
+                        new HateAttribute(tDur, DataLensValueType.Float),
+                        new HateAttribute(tStk, DataLensValueType.Int32),
+                    };
+                    AppendUnique(typeCols, et.Attributes);
+                    BuildTall(new HateTallStore(et.Store, et.Capacity, typeCols.ToArray()));
+                    _effectStores.Add(et.Store);
+                    _effectRoutes.Add((et.Subtree, et.Store));
+                    _effCols[(ulong)et.Store] = new EffCols(_entityIndexTag[(ulong)et.Store], tTag, tDur, tStk);
+                }
             }
 
             // The dedicated Abilities store: reserved machinery columns (identity + cooldown + charges) plus the
@@ -629,6 +664,11 @@ namespace Heathen.HATE
             return view;
         }
 
+        // A globally-unique reserved effect-column tag for a split store (distinct per store + per salt), so the
+        // same logical column (EffectTag/Duration/Stacks) can live in multiple effect stores without a tag clash.
+        private static GameplayTag EffReservedFor(GameplayTag store, ulong salt)
+            => new GameplayTag(unchecked((ulong)store * 0x9E3779B97F4A7C15UL) ^ salt);
+
         private static GameplayTag EntityIndexTagFor(GameplayTag store)
         {
             ulong id = (ulong)store;
@@ -681,17 +721,19 @@ namespace Heathen.HATE
             HateReapply reapply = HateReapply.Refresh, int stacks = 1)
         {
             if (!_hasEffects) throw new InvalidOperationException("No Effects store declared (HateSchema.WithEffects).");
-            DataLensView view = GetTallInsertView(_effectsStore);
+            GameplayTag store = EffectStoreFor(effectTag);
+            EffCols c = _effCols[(ulong)store];
+            DataLensView view = GetTallInsertView(store);
             view.Refresh();
 
             if (reapply != HateReapply.Instance)
             {
-                int existing = FindEffectRow(view, entity.Index, (ulong)effectTag);
+                int existing = FindEffectRow(view, c, entity.Index, (ulong)effectTag);
                 if (existing >= 0)
                 {
                     if (reapply == HateReapply.Stack)
-                        view.Set<int>(existing, _effStacksCol, view.Get<int>(existing, _effStacksCol) + stacks);
-                    view.Set<float>(existing, _effDurationCol, (float)duration); // reset the timer
+                        view.Set<int>(existing, c.Stacks, view.Get<int>(existing, c.Stacks) + stacks);
+                    view.Set<float>(existing, c.Duration, (float)duration); // reset the timer
                     view.SetState(existing, ViewRowState.Modified);
                     view.Commit();
                     return;
@@ -699,16 +741,22 @@ namespace Heathen.HATE
             }
 
             int r = view.AddRow();
-            view.Set<int>(r, _effEntityIndexCol, entity.Index);
-            view.Set<ulong>(r, _effTagCol, (ulong)effectTag);
-            view.Set<float>(r, _effDurationCol, (float)duration);
-            view.Set<int>(r, _effStacksCol, stacks);
+            view.Set<int>(r, c.Ei, entity.Index);
+            view.Set<ulong>(r, c.Tag, (ulong)effectTag);
+            view.Set<float>(r, c.Duration, (float)duration);
+            view.Set<int>(r, c.Stacks, stacks);
             view.SetState(r, ViewRowState.New);
             view.Commit();
         }
 
-        /// <summary>Number of active effect rows on an entity.</summary>
-        public int CountEffects(EntityId entity) => _hasEffects ? CountFor(_effectsStore, entity) : 0;
+        /// <summary>Number of active effect rows on an entity (across every effect store, §7.4).</summary>
+        public int CountEffects(EntityId entity)
+        {
+            if (!_hasEffects) return 0;
+            int total = 0;
+            foreach (GameplayTag store in _effectStores) total += CountFor(store, entity);
+            return total;
+        }
 
         // ── Effect types (§7.4) ──────────────────────────────────────────────
         // A type is a tag-hierarchy position (HATE.Effect.DOT.Poison under HATE.Effect.DOT), so gameplay
@@ -721,15 +769,20 @@ namespace Heathen.HATE
         public int CountEffectsOfType(EntityId entity, GameplayTag typeSubtree)
         {
             if (!_hasEffects) return 0;
-            using (DataLensView v = OpenStoreView(_effectsStore, new[] { _effEntityIndexCol, _effTagCol },
-                new DataLensFilter().Eq(_effEntityIndexCol, entity.Index)))
+            int count = 0;
+            foreach (GameplayTag store in _effectStores)
             {
-                v.Refresh();
-                int count = 0, n = v.RowCount;
-                for (int i = 0; i < n; i++)
-                    if (IsAtOrUnder(v.Get<ulong>(i, _effTagCol), typeSubtree)) count++;
-                return count;
+                EffCols c = _effCols[(ulong)store];
+                using (DataLensView v = OpenStoreView(store, new[] { c.Ei, c.Tag },
+                    new DataLensFilter().Eq(c.Ei, entity.Index)))
+                {
+                    v.Refresh();
+                    int n = v.RowCount;
+                    for (int i = 0; i < n; i++)
+                        if (IsAtOrUnder(v.Get<ulong>(i, c.Tag), typeSubtree)) count++;
+                }
             }
+            return count;
         }
 
         /// <summary>True if the entity has any effect of the given type (or a descendant).</summary>
@@ -745,20 +798,27 @@ namespace Heathen.HATE
         public int RemoveEffectsOfType(EntityId entity, GameplayTag typeSubtree, int max = -1)
         {
             if (!_hasEffects || max == 0) return 0;
-            using (DataLensView v = OpenStoreView(_effectsStore, new[] { _effEntityIndexCol, _effTagCol },
-                new DataLensFilter().Eq(_effEntityIndexCol, entity.Index)))
+            int removed = 0;
+            foreach (GameplayTag store in _effectStores)
             {
-                v.Refresh();
-                int removed = 0, n = v.RowCount;
-                for (int i = 0; i < n; i++)
+                EffCols c = _effCols[(ulong)store];
+                using (DataLensView v = OpenStoreView(store, new[] { c.Ei, c.Tag },
+                    new DataLensFilter().Eq(c.Ei, entity.Index)))
                 {
-                    if (!IsAtOrUnder(v.Get<ulong>(i, _effTagCol), typeSubtree)) continue;
-                    v.SetState(i, ViewRowState.Removed);
-                    if (++removed == max) break;
+                    v.Refresh();
+                    int n = v.RowCount, storeRemoved = 0;
+                    for (int i = 0; i < n; i++)
+                    {
+                        if (!IsAtOrUnder(v.Get<ulong>(i, c.Tag), typeSubtree)) continue;
+                        v.SetState(i, ViewRowState.Removed);
+                        storeRemoved++;
+                        if (++removed == max) break;
+                    }
+                    if (storeRemoved > 0) v.Commit();
                 }
-                if (removed > 0) v.Commit();
-                return removed;
+                if (removed == max) break; // max reached across stores (max < 0 never equals removed)
             }
+            return removed;
         }
 
         // "at or under": the effect's own tag matches the type node, or is a registered descendant of it.
@@ -776,8 +836,12 @@ namespace Heathen.HATE
         public void TickEffects(double dt)
         {
             if (!_hasEffects) return;
-            _lens.RunSystem(_effectsStore, _effDurationCol, SystemOp.Sub, dt);
-            Expire(_effectsStore, _effDurationCol);
+            foreach (GameplayTag store in _effectStores)
+            {
+                EffCols c = _effCols[(ulong)store];
+                _lens.RunSystem(store, c.Duration, SystemOp.Sub, dt);
+                Expire(store, c.Duration);
+            }
         }
 
         /// <summary>
@@ -795,26 +859,29 @@ namespace Heathen.HATE
 
             if (_hasEffects)
             {
-                using (DataLensView ev = OpenStoreView(_effectsStore,
-                    new[] { _effEntityIndexCol, _effTagCol, _effStacksCol }))
+                foreach (GameplayTag store in _effectStores)
                 {
-                    ev.Refresh();
-                    int n = ev.RowCount;
-                    for (int i = 0; i < n; i++)
+                    EffCols c = _effCols[(ulong)store];
+                    using (DataLensView ev = OpenStoreView(store, new[] { c.Ei, c.Tag, c.Stacks }))
                     {
-                        int ent = ev.Get<int>(i, _effEntityIndexCol);
-                        ulong tag = ev.Get<ulong>(i, _effTagCol);
-                        int st = ev.Get<int>(i, _effStacksCol);
-                        if (st < 1) st = 1;
-                        if (!_effectDefs.TryGetValue(tag, out HateModifier[] mods)) continue;
-                        foreach (HateModifier m in mods)
+                        ev.Refresh();
+                        int n = ev.RowCount;
+                        for (int i = 0; i < n; i++)
                         {
-                            if ((ulong)m.Attribute != (ulong)currentAttribute) continue;
-                            switch (m.Op)
+                            int ent = ev.Get<int>(i, c.Ei);
+                            ulong tag = ev.Get<ulong>(i, c.Tag);
+                            int st = ev.Get<int>(i, c.Stacks);
+                            if (st < 1) st = 1;
+                            if (!_effectDefs.TryGetValue(tag, out HateModifier[] mods)) continue;
+                            foreach (HateModifier m in mods)
                             {
-                                case HateOp.Add:      add[ent] = (add.TryGetValue(ent, out double a) ? a : 0) + st * m.Magnitude; break;
-                                case HateOp.Multiply: mul[ent] = (mul.TryGetValue(ent, out double mv) ? mv : 1) * Math.Pow(m.Magnitude, st); break;
-                                case HateOp.Override: over[ent] = m.Magnitude; break;
+                                if ((ulong)m.Attribute != (ulong)currentAttribute) continue;
+                                switch (m.Op)
+                                {
+                                    case HateOp.Add:      add[ent] = (add.TryGetValue(ent, out double a) ? a : 0) + st * m.Magnitude; break;
+                                    case HateOp.Multiply: mul[ent] = (mul.TryGetValue(ent, out double mv) ? mv : 1) * Math.Pow(m.Magnitude, st); break;
+                                    case HateOp.Override: over[ent] = m.Magnitude; break;
+                                }
                             }
                         }
                     }
@@ -893,13 +960,22 @@ namespace Heathen.HATE
             }
         }
 
-        private int FindEffectRow(DataLensView view, int entityIndex, ulong effectTag)
+        private int FindEffectRow(DataLensView view, EffCols c, int entityIndex, ulong effectTag)
         {
             int n = view.RowCount;
             for (int i = 0; i < n; i++)
-                if (view.Get<int>(i, _effEntityIndexCol) == entityIndex && view.Get<ulong>(i, _effTagCol) == effectTag)
+                if (view.Get<int>(i, c.Ei) == entityIndex && view.Get<ulong>(i, c.Tag) == effectTag)
                     return i;
             return -1;
+        }
+
+        // Route an effect to its store by tag subtree (§7.4): the first declared type-split whose subtree the
+        // effect tag is at-or-under, else the monolithic Effects store. Declare nested subtrees most-specific first.
+        private GameplayTag EffectStoreFor(GameplayTag effectTag)
+        {
+            for (int i = 0; i < _effectRoutes.Count; i++)
+                if (IsAtOrUnder((ulong)effectTag, _effectRoutes[i].subtree)) return _effectRoutes[i].store;
+            return _effectsStore;
         }
 
         private static double Combine(double cur, HateOp op, double mag)
