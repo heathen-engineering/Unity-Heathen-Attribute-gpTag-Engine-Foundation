@@ -704,11 +704,39 @@ namespace Heathen.HATE
         /// Use base attributes here; duration buffs target the current attribute and fold via
         /// <see cref="RecomputeAttribute"/>. Returns false if the effect is undefined.
         /// </summary>
+        /// <summary>
+        /// Raised when an ability successfully activates (after cost + charges are paid). A gameplay system
+        /// subscribes to react to "an ability happened" - a cue, a VFX, or a positional action like a jump - with
+        /// no HATE data change required. This is the seam that connects HATE abilities to game logic.
+        /// </summary>
+        public event System.Action<EntityId, GameplayTag> AbilityActivated;
+
+        /// <summary>
+        /// Raised when an effect is applied to an entity. Fires even for a payload-less effect that exists purely to
+        /// signal the game (an effect whose only job is to raise this event), so the game can react to it.
+        /// </summary>
+        public event System.Action<EntityId, GameplayTag> EffectApplied;
+
         public bool ApplyInstant(EntityId entity, GameplayTag effectTag)
         {
             if (!_effectDefs.TryGetValue((ulong)effectTag, out HateModifier[] mods)) return false;
             foreach (HateModifier m in mods)
                 SetAttribute(entity, m.Attribute, Combine(GetAttribute(entity, m.Attribute), m.Op, m.Magnitude));
+            EffectApplied?.Invoke(entity, effectTag);
+            return true;
+        }
+
+        /// <summary>
+        /// Apply an effect instantly with each modifier magnitude multiplied by <paramref name="scale"/> — the
+        /// scalar operation for effects (§7.1). Lets one WeaponHit effect carry a rolled/mitigated amount: pass
+        /// <c>roll * (1 - mitigation)</c> and the effect still owns "what" it does. Returns false if undefined.
+        /// </summary>
+        public bool ApplyInstant(EntityId entity, GameplayTag effectTag, double scale)
+        {
+            if (!_effectDefs.TryGetValue((ulong)effectTag, out HateModifier[] mods)) return false;
+            foreach (HateModifier m in mods)
+                SetAttribute(entity, m.Attribute, Combine(GetAttribute(entity, m.Attribute), m.Op, m.Magnitude * scale));
+            EffectApplied?.Invoke(entity, effectTag);
             return true;
         }
 
@@ -747,6 +775,48 @@ namespace Heathen.HATE
             view.Set<int>(r, c.Stacks, stacks);
             view.SetState(r, ViewRowState.New);
             view.Commit();
+        }
+
+        /// <summary>
+        /// Seconds remaining on a specific duration effect on an entity (0 if it is not active). Lets a gameplay
+        /// system show a buff/debuff timer — e.g. a HUD meter for a temporary slow — driven by the real effect.
+        /// </summary>
+        public float EffectRemaining(EntityId entity, GameplayTag effectTag)
+        {
+            if (!_hasEffects) return 0f;
+            GameplayTag store = EffectStoreFor(effectTag);
+            EffCols c = _effCols[(ulong)store];
+            DataLensView view = GetTallInsertView(store);
+            view.Refresh();
+            int row = FindEffectRow(view, c, entity.Index, (ulong)effectTag);
+            return row >= 0 ? view.Get<float>(row, c.Duration) : 0f;
+        }
+
+        /// <summary>
+        /// Collect an entity's active (duration) effects into the parallel lists <paramref name="tags"/> and
+        /// <paramref name="remaining"/> (seconds left) — for a HUD buff/debuff list with a decay bar. Clears both
+        /// first. Instant effects never appear (they leave no row).
+        /// </summary>
+        public void CollectEffects(EntityId entity, List<GameplayTag> tags, List<float> remaining)
+        {
+            tags.Clear();
+            remaining.Clear();
+            if (!_hasEffects) return;
+            foreach (GameplayTag store in _effectStores)
+            {
+                EffCols c = _effCols[(ulong)store];
+                using (DataLensView v = OpenStoreView(store, new[] { c.Ei, c.Tag, c.Duration },
+                    new DataLensFilter().Eq(c.Ei, entity.Index)))
+                {
+                    v.Refresh();
+                    int n = v.RowCount;
+                    for (int i = 0; i < n; i++)
+                    {
+                        tags.Add(new GameplayTag(v.Get<ulong>(i, c.Tag)));
+                        remaining.Add(v.Get<float>(i, c.Duration));
+                    }
+                }
+            }
         }
 
         /// <summary>Number of active effect rows on an entity (across every effect store, §7.4).</summary>
@@ -1126,6 +1196,8 @@ namespace Heathen.HATE
             foreach (EntityId t in ResolveTargets(caster, def.TargetMode, input))
                 foreach (GameplayTag e in def.Effects)
                     ApplyInstant(t, e);
+
+            AbilityActivated?.Invoke(caster, abilityTag);   // signal the game: an ability happened (drive cues, jumps, VFX)
             return true;
         }
 
