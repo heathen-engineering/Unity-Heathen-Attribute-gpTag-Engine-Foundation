@@ -72,7 +72,7 @@ namespace Heathen.HATE
                 {
                     if (!_masterTraitJoin.TryGetValue((ulong)trait.Id, out int j)) continue;
                     long row = m.SourceJoinRow(vr, j);
-                    if (row >= 0) result.Add(new HateStoreScope(trait.Id, BitmaskOf((int)row)));
+                    if (row >= 0) result.Add(new HateStoreScope(trait.Id, BitmaskOf((ulong)row)));
                 }
             }
 
@@ -106,14 +106,14 @@ namespace Heathen.HATE
                 if (vr >= 0 && _masterTraitJoin.TryGetValue((ulong)store, out int j))
                 {
                     long row = m.SourceJoinRow(vr, j);
-                    if (row >= 0) return BitmaskOf((int)row);
+                    if (row >= 0) return BitmaskOf((ulong)row);
                 }
             }
             return Array.Empty<ulong>();
         }
 
         // Rows in a tall store owned by the entity (EntityIndex == entity), as a row-index bitmask.
-        private ulong[] ScanTallRows(GameplayTag store, GameplayTag entityIndexCol, int entityIndex)
+        private ulong[] ScanTallRows(GameplayTag store, GameplayTag entityIndexCol, ulong entityIndex)
         {
             using (DataLensView v = OpenStoreView(store, new[] { entityIndexCol },
                        new DataLensFilter().Eq(entityIndexCol, entityIndex)))
@@ -136,11 +136,12 @@ namespace Heathen.HATE
             }
         }
 
-        private static ulong[] BitmaskOf(int row)
+        private static ulong[] BitmaskOf(ulong row)
         {
-            if (row < 0) return Array.Empty<ulong>();
-            var bits = new ulong[(row >> 6) + 1];
-            bits[row >> 6] |= 1UL << (row & 63);
+            if (row == ulong.MaxValue) return Array.Empty<ulong>();
+            int word = (int)(row >> 6);
+            var bits = new ulong[word + 1];
+            bits[word] |= 1UL << (int)(row & 63);
             return bits;
         }
     }

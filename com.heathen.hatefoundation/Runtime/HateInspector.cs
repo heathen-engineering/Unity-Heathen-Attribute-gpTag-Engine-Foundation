@@ -83,7 +83,7 @@ namespace Heathen.HATE
             for (int i = 0; i < n; i++)
             {
                 long row = cv.SourceRow(i);
-                if (row >= 0) list.Add(new EntityId((int)row));
+                if (row >= 0) list.Add(new EntityId((ulong)row));
             }
             return list;
         }

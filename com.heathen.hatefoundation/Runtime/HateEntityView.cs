@@ -49,7 +49,7 @@ namespace Heathen.HATE
         {
             int n = _view.RowCount;
             for (int i = 0; i < n; i++)
-                if (_view.SourceRow(i) == entity.Index)
+                if (_view.SourceRow(i) == (long)entity.Index)
                     return new DataViewRecord(_view, i);
             return default;
         }
@@ -152,7 +152,7 @@ namespace Heathen.HATE
             int n = _view.RowCount;
             ulong tag = (ulong)childTag;
             for (int i = 0; i < n; i++)
-                if (_view.Get<int>(i, _entityIndexCol) == entity.Index && _view.Get<ulong>(i, _tagCol) == tag)
+                if (_view.Get<ulong>(i, _entityIndexCol) == entity.Index && _view.Get<ulong>(i, _tagCol) == tag)
                     return new DataViewRecord(_view, i);
             return default;
         }

@@ -27,6 +27,8 @@ namespace Heathen.HATE
         internal double CostAmount;
         internal HateCondition[] Requirements = Array.Empty<HateCondition>();
         internal GameplayTag[] SourceEffects = Array.Empty<GameplayTag>(); // cost effects applied to each resolved source
+        internal IHatePredicate Predicate;   // the redesign's eligibility predicate (a tree), evaluated over OnEntity
+        internal HateAction Action;          // the redesign's Action (guarded steps + fork): what the ability does
 
         public HateAbilityDef WithCooldown(double cooldown) { Cooldown = cooldown; return this; }
         /// <summary>Sets how the ability selects targets (default <see cref="HateTargetMode.Supplied"/>).</summary>
@@ -48,6 +50,13 @@ namespace Heathen.HATE
         public HateAbilityDef AppliesToSource(params GameplayTag[] effects) { SourceEffects = effects ?? Array.Empty<GameplayTag>(); return this; }
         /// <summary>Alias of <see cref="AppliesToSource"/> kept for the common caster-pays case (default source mode).</summary>
         public HateAbilityDef AppliesToCaster(params GameplayTag[] effects) => AppliesToSource(effects);
+
+        /// <summary>Set the redesign eligibility <b>predicate</b> (an <see cref="IHatePredicate"/> tree), evaluated
+        /// over the activator (OnEntity) by <c>Activate(ability, onEntity, sources, targets)</c>.</summary>
+        public HateAbilityDef WithPredicate(IHatePredicate predicate) { Predicate = predicate; return this; }
+
+        /// <summary>Set the redesign <b>Action</b> (guarded steps + fork) — what the ability does on activation.</summary>
+        public HateAbilityDef WithAction(HateAction action) { Action = action; return this; }
     }
 
     /// <summary>

@@ -27,6 +27,12 @@ namespace Heathen.HATE
         private readonly Dictionary<ulong, ulong> _attrTrait = new Dictionary<ulong, ulong>();             // attr id -> owning trait id
         private readonly Dictionary<ulong, DataLensValueType> _attrType = new Dictionary<ulong, DataLensValueType>();
 
+        // The deterministic world RNG (HATE-Spec §10): the source for ability/effect Chance + ranged magnitude.
+        // Seeded reproducibly; advanced across activations so repeated activations differ. Set via Seed for replay.
+        private HateRng _rng = new HateRng(0x48415445_524E4701UL); // "HATE" + a nonce; override with Seed(...)
+        // A pooled collection reused by BuildEntityRecord so a per-activation flash does not allocate.
+        private readonly GameplayTagCollection _recordScratch = new GameplayTagCollection();
+
         private readonly Dictionary<string, DataLensView> _spawnViews = new Dictionary<string, DataLensView>();
         private DataLensView _master;                                   // catalog + all traits, all attrs (read/write)
         private Dictionary<ulong, int> _masterTraitJoin;               // trait id -> master view join index
@@ -60,6 +66,25 @@ namespace Heathen.HATE
         }
         private readonly Dictionary<ulong, EffCols> _effCols = new Dictionary<ulong, EffCols>();
         private readonly Dictionary<ulong, HateModifier[]> _effectDefs = new Dictionary<ulong, HateModifier[]>();
+        // Per-effect duration policy so ApplyEffect can dispatch instant vs duration (absent = instant).
+        private readonly Dictionary<ulong, EffectTiming> _effectTiming = new Dictionary<ulong, EffectTiming>();
+        // Per-effect ONGOING requirement (§7): while unmet the effect is suspended (kept, but skipped in the fold).
+        private readonly Dictionary<ulong, EffectRequirement> _effectRequire = new Dictionary<ulong, EffectRequirement>();
+
+        private struct EffectTiming { public float Duration; public HateReapply Reapply; public bool Infinite; }
+        private struct EffectRequirement { public GameplayTag[] Present; public GameplayTag[] Absent; }
+
+        // Self-healing row-index hint caches. Finding an effect / ability / granted-tag row by (entity, tag), and a
+        // master row by catalog index, was an O(rows) linear scan on every call (get/set an attribute, activate an
+        // ability, reapply an effect, ...). These cache the last row a key resolved to, but EVERY cached hit is
+        // re-validated against the live columns / SourceRow before it is trusted: a hint that has gone stale (the
+        // store compacted, the row was freed or reused) simply fails the check, falls back to the scan, and
+        // re-seeds — so the cache can NEVER return a wrong row and needs no knowledge of the store's row-stability
+        // rules. Repeated lookups of the same key become O(1); the worst case is the original scan (no regression).
+        private readonly Dictionary<(ulong ent, ulong tag), int> _effectRowHint = new Dictionary<(ulong, ulong), int>();
+        private readonly Dictionary<(ulong ent, ulong tag), int> _abilityRowHint = new Dictionary<(ulong, ulong), int>();
+        private readonly Dictionary<(ulong ent, ulong tag), int> _tagRowHint = new Dictionary<(ulong, ulong), int>();
+        private readonly Dictionary<ulong, int> _masterRowHint = new Dictionary<ulong, int>();
 
         // Abilities store (HATE-Spec §8) + the ability-def table + the activation request queue.
         private bool _hasAbilities;
@@ -117,7 +142,7 @@ namespace Heathen.HATE
                 _entityIndexTag[(ulong)tall.Id] = ei;
 
                 var cols = new DataColumn[tall.Columns.Count + 1];
-                cols[0] = DataColumn.OfType(ei, DataLensValueType.Int32); // default 0; always set on insert
+                cols[0] = DataColumn.OfType(ei, DataLensValueType.UInt64); // EntityIndex stores an EntityId (ulong); default 0, always set on insert
                 for (int i = 0; i < tall.Columns.Count; i++)
                 {
                     HateAttribute a = tall.Columns[i];
@@ -234,7 +259,7 @@ namespace Heathen.HATE
 
             long catalogRow = view.SourceRow(r);  // Core records the allocated catalog row in the source map
             if (catalogRow < 0) return EntityId.None;
-            var id = new EntityId((int)catalogRow);
+            var id = new EntityId((ulong)catalogRow);
             _spawned.Add(id);                     // polled "needs-visual" queue (§14)
             return id;
         }
@@ -272,7 +297,7 @@ namespace Heathen.HATE
             {
                 long catalogRow = view.SourceRow(rows[i]);
                 if (catalogRow < 0) { ids[i] = EntityId.None; continue; }
-                ids[i] = new EntityId((int)catalogRow);
+                ids[i] = new EntityId((ulong)catalogRow);
                 _spawned.Add(ids[i]);
             }
             return ids;
@@ -540,7 +565,7 @@ namespace Heathen.HATE
                 v.Refresh();
                 int n = v.RowCount;
                 for (int i = 0; i < n; i++)
-                    react?.Invoke(new EntityId((int)v.SourceRow(i)), v, i);
+                    react?.Invoke(new EntityId((ulong)v.SourceRow(i)), v, i);
                 if (n > 0) v.Commit();
                 return n;
             }
@@ -583,6 +608,20 @@ namespace Heathen.HATE
             _lens.RunSystemColumn(trait, targetColumn, op, operandColumn);
         }
 
+        /// <summary>
+        /// Run an ordered pipeline of Trait Systems over a trait's store in ONE fused dispatch (decision #17: HATE
+        /// describes the ordered steps, DataLens fuses + runs them). Each <see cref="DataSystemStep"/> is a
+        /// columnar op (scalar or cross-column, optionally predicated) targeting a column of <paramref name="trait"/>;
+        /// the steps run in the given order (so a regen chain like <c>Step=0; Step+=Rate; Step*=dt; Stamina+=Step;
+        /// Stamina=Min(MaxStamina)</c> is one native pass, not five managed round-trips). This is the fast path
+        /// that replaces a sequence of <see cref="RunTraitSystem"/> calls over the same store.
+        /// </summary>
+        public ulong RunTraitPipeline(GameplayTag trait, params DataSystemStep[] steps)
+        {
+            if (!_traitOf.ContainsKey((ulong)trait)) throw new ArgumentException($"Unknown trait {(ulong)trait}.");
+            return _lens.RunSystemBatch(trait, steps);
+        }
+
         // ── Tall stores (effects / abilities) ────────────────────────────────
 
         /// <summary>The synthesised EntityIndex column tag of a tall store (scope on it: WHERE EntityIndex == N).</summary>
@@ -602,7 +641,7 @@ namespace Heathen.HATE
             DataLensView view = GetTallInsertView(store);
             view.Refresh();                       // reset stale New rows (perf TODO: batch insert)
             int r = view.AddRow();
-            view.Set<int>(r, _entityIndexTag[(ulong)store], owner.Index);
+            view.Set<ulong>(r, _entityIndexTag[(ulong)store], owner.Index);
             if (values != null)
                 foreach ((GameplayTag col, double value) in values)
                     if (_attrType.TryGetValue((ulong)col, out DataLensValueType t))
@@ -695,15 +734,69 @@ namespace Heathen.HATE
 
         // ── Effects: definition, application, duration aggregation (§7) ───────
 
+        /// <summary>
+        /// Flash an entity's live state into a read-only <see cref="EntityRecord"/> (the redesign's "DataState",
+        /// HATE-Spec §8): every trait attribute this world knows (by value) plus granted-tag and active-effect
+        /// presence, materialised into a <see cref="GameplayTagCollection"/> a predicate / ability invocation can
+        /// read by tag. Pass a pooled <paramref name="into"/> to avoid a per-call allocation (it is cleared
+        /// first). Correctness-first: reads all attributes each call; the archetype interface's flash-on-cadence
+        /// cache and P2 fusion are the fast paths. A game adds transient params (velocity, airborne) to the same
+        /// collection before invoking.
+        /// </summary>
+        public EntityRecord BuildEntityRecord(EntityId entity, GameplayTagCollection into = null)
+        {
+            var state = into ?? new GameplayTagCollection();
+            if (into != null) state.Clear();
+
+            DataLensView m = Master();
+            m.Refresh();
+            int vr = FindRow(m, entity.Index);
+            if (vr >= 0)
+            {
+                // Only TRAIT attributes are projected by the Master view; _attrType also holds tall-store columns
+                // (ability Cooldown/Charges, effect Duration/Stacks) which Master does not project. _attrTrait is
+                // the trait-attribute set. Normalise each to a double (GetTyped converts integral/single/double
+                // losslessly) so predicates read uniformly via GetDouble - no per-tag numeric kind to track.
+                foreach (ulong attrId in _attrTrait.Keys)
+                {
+                    var tag = new GameplayTag(attrId);
+                    state.SetDouble(tag, GetTyped(m, vr, tag, _attrType[attrId]));
+                }
+            }
+
+            // Granted-tag presence (status/immunity) so a predicate's Present/Absent reads true/false.
+            if (_hasGrantedTags)
+                using (DataLensView v = OpenStoreView(_grantedStore, new[] { _grEntityIndexCol, _grTagCol },
+                    new DataLensFilter().Eq(_grEntityIndexCol, entity.Index)))
+                {
+                    v.Refresh();
+                    int n = v.RowCount;
+                    for (int i = 0; i < n; i++)
+                        state.AddTag(new GameplayTag(v.Get<ulong>(i, _grTagCol)));
+                }
+
+            // Active-effect presence so a predicate's "has effect X" reads true.
+            if (_hasEffects)
+                foreach (GameplayTag store in _effectStores)
+                {
+                    EffCols c = _effCols[(ulong)store];
+                    using (DataLensView v = OpenStoreView(store, new[] { c.Ei, c.Tag },
+                        new DataLensFilter().Eq(c.Ei, entity.Index)))
+                    {
+                        v.Refresh();
+                        int n = v.RowCount;
+                        for (int i = 0; i < n; i++)
+                            state.AddTag(new GameplayTag(v.Get<ulong>(i, c.Tag)));
+                    }
+                }
+
+            return new EntityRecord(entity, state);
+        }
+
         /// <summary>Register an effect's static modifier bag (A), addressed by tag (HATE-Spec §7.2).</summary>
         public void DefineEffect(GameplayTag effectTag, params HateModifier[] modifiers)
             => _effectDefs[(ulong)effectTag] = modifiers ?? Array.Empty<HateModifier>();
 
-        /// <summary>
-        /// Apply an effect instantly: each modifier permanently changes the target attribute (§7.1 Instant).
-        /// Use base attributes here; duration buffs target the current attribute and fold via
-        /// <see cref="RecomputeAttribute"/>. Returns false if the effect is undefined.
-        /// </summary>
         /// <summary>
         /// Raised when an ability successfully activates (after cost + charges are paid). A gameplay system
         /// subscribes to react to "an ability happened" - a cue, a VFX, or a positional action like a jump - with
@@ -712,19 +805,27 @@ namespace Heathen.HATE
         public event System.Action<EntityId, GameplayTag> AbilityActivated;
 
         /// <summary>
-        /// Raised when an effect is applied to an entity. Fires even for a payload-less effect that exists purely to
-        /// signal the game (an effect whose only job is to raise this event), so the game can react to it.
+        /// Raised when an effect is applied to an entity (target, effect). Fires even for a payload-less effect that
+        /// exists purely to signal the game, so the game can react. See <see cref="EffectAppliedBy"/> for the
+        /// variant that also carries the instigator (who applied it).
         /// </summary>
         public event System.Action<EntityId, GameplayTag> EffectApplied;
 
+        /// <summary>
+        /// Raised when an effect is applied, carrying (target, effect, <b>instigator</b>) — who applied it
+        /// (<see cref="EntityId.None"/> when unattributed). This is the seam procs ride: "when hit, apply Thorns to
+        /// the attacker" reads the instigator here. Fires for both instant (<see cref="ApplyInstant(EntityId,
+        /// GameplayTag, EntityId)"/>) and duration (<see cref="AddEffect"/>) applications.
+        /// </summary>
+        public event System.Action<EntityId, GameplayTag, EntityId> EffectAppliedBy;
+
+        /// <summary>
+        /// Apply an effect instantly: each modifier permanently changes the target attribute (§7.1 Instant). Use
+        /// base attributes here; duration buffs target the current attribute and fold via
+        /// <see cref="RecomputeAttribute"/>. Returns false if the effect is undefined.
+        /// </summary>
         public bool ApplyInstant(EntityId entity, GameplayTag effectTag)
-        {
-            if (!_effectDefs.TryGetValue((ulong)effectTag, out HateModifier[] mods)) return false;
-            foreach (HateModifier m in mods)
-                SetAttribute(entity, m.Attribute, Combine(GetAttribute(entity, m.Attribute), m.Op, m.Magnitude));
-            EffectApplied?.Invoke(entity, effectTag);
-            return true;
-        }
+            => ApplyInstantCore(entity, effectTag, 1.0, EntityId.None, ref _rng, default);
 
         /// <summary>
         /// Apply an effect instantly with each modifier magnitude multiplied by <paramref name="scale"/> — the
@@ -732,12 +833,104 @@ namespace Heathen.HATE
         /// <c>roll * (1 - mitigation)</c> and the effect still owns "what" it does. Returns false if undefined.
         /// </summary>
         public bool ApplyInstant(EntityId entity, GameplayTag effectTag, double scale)
+            => ApplyInstantCore(entity, effectTag, scale, EntityId.None, ref _rng, default);
+
+        /// <summary>
+        /// Apply an effect instantly, attributed to <paramref name="instigator"/> (who applied it) — the
+        /// procs / receive-side seam, surfaced via <see cref="EffectAppliedBy"/>. Returns false if undefined.
+        /// </summary>
+        public bool ApplyInstant(EntityId entity, GameplayTag effectTag, EntityId instigator)
+            => ApplyInstantCore(entity, effectTag, 1.0, instigator, ref _rng, default);
+
+        /// <summary>Apply an effect instantly with both a magnitude <paramref name="scale"/> and an
+        /// <paramref name="instigator"/>. Returns false if the effect is undefined.</summary>
+        public bool ApplyInstant(EntityId entity, GameplayTag effectTag, double scale, EntityId instigator)
+            => ApplyInstantCore(entity, effectTag, scale, instigator, ref _rng, default);
+
+        private bool ApplyInstantCore(EntityId entity, GameplayTag effectTag, double scale, EntityId instigator,
+            ref HateRng rng, in EntityRecord payload)
         {
             if (!_effectDefs.TryGetValue((ulong)effectTag, out HateModifier[] mods)) return false;
             foreach (HateModifier m in mods)
-                SetAttribute(entity, m.Attribute, Combine(GetAttribute(entity, m.Attribute), m.Op, m.Magnitude * scale));
+            {
+                // Magnitude resolution (§7.2), in precedence: an MMC/attribute-capture computes coeff·captured +
+                // offset (captured from the target's live attribute or the caller's payload); else a caller-injected
+                // SetByCaller value; else a ranged modifier rolls [min,max]; else the fixed Magnitude. Then scale.
+                double mag;
+                if (m.CaptureAttribute.IsValid)
+                {
+                    double captured = m.CaptureFromTarget
+                        ? GetAttribute(entity, m.CaptureAttribute)
+                        : (payload.IsValid && payload.Has(m.CaptureAttribute) ? payload.GetDouble(m.CaptureAttribute) : 0.0);
+                    mag = m.Coefficient * captured + m.CaptureOffset;
+                }
+                else if (m.SetByCaller.IsValid && payload.IsValid && payload.Has(m.SetByCaller))
+                    mag = payload.GetDouble(m.SetByCaller);
+                else
+                    mag = m.MagnitudeMax == m.Magnitude ? m.Magnitude : rng.RangeDouble(m.Magnitude, m.MagnitudeMax);
+                SetAttribute(entity, m.Attribute, Combine(GetAttribute(entity, m.Attribute), m.Op, mag * scale));
+            }
             EffectApplied?.Invoke(entity, effectTag);
+            EffectAppliedBy?.Invoke(entity, effectTag, instigator);
             return true;
+        }
+
+        /// <summary>
+        /// Register an effect's duration policy so <see cref="ApplyEffect"/> knows to grant it as a duration row
+        /// (via <see cref="AddEffect"/>) rather than apply it instantly. Duration in seconds; <paramref
+        /// name="infinite"/> true means "until removed". Effects with no timing registered are instant.
+        /// </summary>
+        public void DefineEffectTiming(GameplayTag effect, float duration,
+            HateReapply reapply = HateReapply.Refresh, bool infinite = false)
+            => _effectTiming[(ulong)effect] = new EffectTiming { Duration = duration, Reapply = reapply, Infinite = infinite };
+
+        /// <summary>
+        /// Register an ONGOING requirement for a duration effect (§7): while the entity is missing any
+        /// <paramref name="requirePresent"/> tag or holds any <paramref name="requireAbsent"/> tag, the effect is
+        /// SUSPENDED — its row and timer persist but it stops contributing to the fold — and it resumes
+        /// automatically once the requirement holds again. Evaluated each <see cref="RecomputeAttributes"/> against
+        /// the entity's granted tags. (An instant effect never folds, so a requirement is meaningful for durations.)
+        /// </summary>
+        public void DefineEffectRequirement(GameplayTag effect, GameplayTag[] requirePresent = null, GameplayTag[] requireAbsent = null)
+            => _effectRequire[(ulong)effect] = new EffectRequirement
+            {
+                Present = requirePresent ?? System.Array.Empty<GameplayTag>(),
+                Absent = requireAbsent ?? System.Array.Empty<GameplayTag>(),
+            };
+
+        // True when an effect is currently SUSPENDED for an entity: it has an ongoing requirement that is unmet
+        // (a required tag missing, or a forbidden tag present). Suspended rows keep their timer but skip the fold.
+        private bool IsSuspended(ulong effectTag, EntityId entity)
+        {
+            if (!_effectRequire.TryGetValue(effectTag, out EffectRequirement req)) return false;
+            for (int i = 0; i < req.Present.Length; i++) if (!HasTag(entity, req.Present[i])) return true;
+            for (int i = 0; i < req.Absent.Length; i++) if (HasTag(entity, req.Absent[i])) return true;
+            return false;
+        }
+
+        /// <summary>
+        /// Apply an effect to an entity, dispatching on its registered duration policy: a duration/infinite effect
+        /// is granted as a tall row (folded by <see cref="RecomputeAttribute"/>), an instant effect changes the
+        /// attributes immediately. Attributed to <paramref name="instigator"/> for procs. This is the unified
+        /// application the Action interpreter calls, so a step author never has to choose instant vs duration.
+        /// </summary>
+        public bool ApplyEffect(EntityId entity, GameplayTag effect, EntityId instigator)
+            => ApplyEffect(entity, effect, instigator, ref _rng);
+
+        /// <summary>
+        /// As <see cref="ApplyEffect(EntityId,GameplayTag,EntityId)"/> but rolling any ranged magnitudes from the
+        /// supplied <paramref name="rng"/> — the Action interpreter passes its context stream so every roll in one
+        /// activation (forks, magnitudes) draws from a single deterministic sequence.
+        /// </summary>
+        public bool ApplyEffect(EntityId entity, GameplayTag effect, EntityId instigator, ref HateRng rng, in EntityRecord payload = default)
+        {
+            if (_effectTiming.TryGetValue((ulong)effect, out EffectTiming t) && (t.Infinite || t.Duration > 0f))
+            {
+                if (!_hasEffects) return false;
+                AddEffect(entity, effect, t.Infinite ? float.MaxValue : t.Duration, t.Reapply, 1, instigator);
+                return true;
+            }
+            return ApplyInstantCore(entity, effect, 1.0, instigator, ref rng, payload);
         }
 
         /// <summary>
@@ -747,6 +940,15 @@ namespace Heathen.HATE
         /// </summary>
         public void AddEffect(EntityId entity, GameplayTag effectTag, double duration,
             HateReapply reapply = HateReapply.Refresh, int stacks = 1)
+            => AddEffect(entity, effectTag, duration, reapply, stacks, EntityId.None);
+
+        /// <summary>
+        /// As <see cref="AddEffect(EntityId,GameplayTag,double,HateReapply,int)"/>, attributed to
+        /// <paramref name="instigator"/> (who applied it) so procs can read it via <see cref="EffectAppliedBy"/>.
+        /// Pass <see cref="EntityId.None"/> for an unattributed application.
+        /// </summary>
+        public void AddEffect(EntityId entity, GameplayTag effectTag, double duration,
+            HateReapply reapply, int stacks, EntityId instigator)
         {
             if (!_hasEffects) throw new InvalidOperationException("No Effects store declared (HateSchema.WithEffects).");
             GameplayTag store = EffectStoreFor(effectTag);
@@ -764,17 +966,19 @@ namespace Heathen.HATE
                     view.Set<float>(existing, c.Duration, (float)duration); // reset the timer
                     view.SetState(existing, ViewRowState.Modified);
                     view.Commit();
+                    EffectAppliedBy?.Invoke(entity, effectTag, instigator);
                     return;
                 }
             }
 
             int r = view.AddRow();
-            view.Set<int>(r, c.Ei, entity.Index);
+            view.Set<ulong>(r, c.Ei, entity.Index);
             view.Set<ulong>(r, c.Tag, (ulong)effectTag);
             view.Set<float>(r, c.Duration, (float)duration);
             view.Set<int>(r, c.Stacks, stacks);
             view.SetState(r, ViewRowState.New);
             view.Commit();
+            EffectAppliedBy?.Invoke(entity, effectTag, instigator);
         }
 
         /// <summary>
@@ -922,10 +1126,34 @@ namespace Heathen.HATE
         /// records in HATE code (DataLens neither types nor aggregates).
         /// </summary>
         public void RecomputeAttribute(GameplayTag baseAttribute, GameplayTag currentAttribute)
+            => RecomputeAttributes((baseAttribute, currentAttribute));
+
+        /// <summary>
+        /// Recompute several buffable attributes at once (HATE-Spec §7.2), folding all of them in a SINGLE effect
+        /// scan and a SINGLE master pass instead of one of each per attribute. For every pair
+        /// <c>(base, current)</c>: <c>Current = override ?? (Base + ΣAdd)·ΠMul</c>, stacking-aware. This is the
+        /// fused form (decision #17) - a game that folds N buffable attributes each frame (regen rate, mitigation,
+        /// damage-taken, ...) pays for one pass over the effect rows and one over the entities, not N. The
+        /// single-attribute <see cref="RecomputeAttribute"/> is a one-pair wrapper.
+        /// </summary>
+        public void RecomputeAttributes(params (GameplayTag Base, GameplayTag Current)[] pairs)
         {
-            var add = new Dictionary<int, double>();
-            var mul = new Dictionary<int, double>();
-            var over = new Dictionary<int, double>();
+            if (pairs == null || pairs.Length == 0) return;
+            int k = pairs.Length;
+
+            // Per-pair accumulators, plus a currentAttribute -> pair-index map so one effect scan buckets every
+            // modifier into the right attribute.
+            var add = new Dictionary<ulong, double>[k];
+            var mul = new Dictionary<ulong, double>[k];
+            var over = new Dictionary<ulong, double>[k];
+            var currentToPair = new Dictionary<ulong, int>(k);
+            for (int i = 0; i < k; i++)
+            {
+                add[i] = new Dictionary<ulong, double>();
+                mul[i] = new Dictionary<ulong, double>();
+                over[i] = new Dictionary<ulong, double>();
+                currentToPair[(ulong)pairs[i].Current] = i;
+            }
 
             if (_hasEffects)
             {
@@ -938,19 +1166,22 @@ namespace Heathen.HATE
                         int n = ev.RowCount;
                         for (int i = 0; i < n; i++)
                         {
-                            int ent = ev.Get<int>(i, c.Ei);
+                            ulong ent = ev.Get<ulong>(i, c.Ei);
                             ulong tag = ev.Get<ulong>(i, c.Tag);
                             int st = ev.Get<int>(i, c.Stacks);
                             if (st < 1) st = 1;
+                            // Ongoing-requirement suspend (§7): an effect whose requirement is currently unmet keeps
+                            // its row but does not contribute to the fold (resumes automatically when met again).
+                            if (_effectRequire.Count > 0 && IsSuspended(tag, new EntityId(ent))) continue;
                             if (!_effectDefs.TryGetValue(tag, out HateModifier[] mods)) continue;
                             foreach (HateModifier m in mods)
                             {
-                                if ((ulong)m.Attribute != (ulong)currentAttribute) continue;
+                                if (!currentToPair.TryGetValue((ulong)m.Attribute, out int idx)) continue;
                                 switch (m.Op)
                                 {
-                                    case HateOp.Add:      add[ent] = (add.TryGetValue(ent, out double a) ? a : 0) + st * m.Magnitude; break;
-                                    case HateOp.Multiply: mul[ent] = (mul.TryGetValue(ent, out double mv) ? mv : 1) * Math.Pow(m.Magnitude, st); break;
-                                    case HateOp.Override: over[ent] = m.Magnitude; break;
+                                    case HateOp.Add:      add[idx][ent] = (add[idx].TryGetValue(ent, out double a) ? a : 0) + st * m.Magnitude; break;
+                                    case HateOp.Multiply: mul[idx][ent] = (mul[idx].TryGetValue(ent, out double mv) ? mv : 1) * Math.Pow(m.Magnitude, st); break;
+                                    case HateOp.Override: over[idx][ent] = m.Magnitude; break;
                                 }
                             }
                         }
@@ -958,20 +1189,29 @@ namespace Heathen.HATE
                 }
             }
 
+            var baseType = new DataLensValueType[k];
+            var curType = new DataLensValueType[k];
+            for (int i = 0; i < k; i++)
+            {
+                baseType[i] = _attrType[(ulong)pairs[i].Base];
+                curType[i] = _attrType[(ulong)pairs[i].Current];
+            }
+
             DataLensView master = Master();
             master.Refresh();
-            DataLensValueType baseType = _attrType[(ulong)baseAttribute];
-            DataLensValueType curType = _attrType[(ulong)currentAttribute];
             int rows = master.RowCount;
             bool any = false;
             for (int vr = 0; vr < rows; vr++)
             {
-                int ent = (int)master.SourceRow(vr);
-                double baseV = GetTyped(master, vr, baseAttribute, baseType);
-                double a = add.TryGetValue(ent, out double av) ? av : 0;
-                double mv = mul.TryGetValue(ent, out double mvv) ? mvv : 1;
-                double cur = over.TryGetValue(ent, out double ov) ? ov : (baseV + a) * mv;
-                SetTyped(master, vr, currentAttribute, curType, cur);
+                ulong ent = (ulong)master.SourceRow(vr);
+                for (int i = 0; i < k; i++)
+                {
+                    double baseV = GetTyped(master, vr, pairs[i].Base, baseType[i]);
+                    double a = add[i].TryGetValue(ent, out double av) ? av : 0;
+                    double mv = mul[i].TryGetValue(ent, out double mvv) ? mvv : 1;
+                    double cur = over[i].TryGetValue(ent, out double ov) ? ov : (baseV + a) * mv;
+                    SetTyped(master, vr, pairs[i].Current, curType[i], cur);
+                }
                 master.SetState(vr, ViewRowState.Modified);
                 any = true;
             }
@@ -1030,12 +1270,17 @@ namespace Heathen.HATE
             }
         }
 
-        private int FindEffectRow(DataLensView view, EffCols c, int entityIndex, ulong effectTag)
+        private int FindEffectRow(DataLensView view, EffCols c, ulong entityIndex, ulong effectTag)
         {
+            var key = (entityIndex, effectTag);
             int n = view.RowCount;
+            if (_effectRowHint.TryGetValue(key, out int hint) && (uint)hint < (uint)n
+                && view.Get<ulong>(hint, c.Ei) == entityIndex && view.Get<ulong>(hint, c.Tag) == effectTag)
+                return hint;
             for (int i = 0; i < n; i++)
-                if (view.Get<int>(i, c.Ei) == entityIndex && view.Get<ulong>(i, c.Tag) == effectTag)
-                    return i;
+                if (view.Get<ulong>(i, c.Ei) == entityIndex && view.Get<ulong>(i, c.Tag) == effectTag)
+                { _effectRowHint[key] = i; return i; }
+            _effectRowHint.Remove(key);
             return -1;
         }
 
@@ -1079,7 +1324,7 @@ namespace Heathen.HATE
             view.Refresh();
             if (FindAbilityRow(view, entity.Index, (ulong)abilityTag) >= 0) return;
             int r = view.AddRow();
-            view.Set<int>(r, _abEntityIndexCol, entity.Index);
+            view.Set<ulong>(r, _abEntityIndexCol, entity.Index);
             view.Set<ulong>(r, _abTagCol, (ulong)abilityTag);
             view.Set<float>(r, _abCooldownCol, 0f);
             view.Set<int>(r, _abChargesCol, charges);
@@ -1201,6 +1446,68 @@ namespace Heathen.HATE
             return true;
         }
 
+        /// <summary>
+        /// Activate an ability in the redesign model (HATE-Spec §8): gate on grant + charges, evaluate the
+        /// ability's <see cref="HateAbilityDef.Predicate"/> over <paramref name="onEntity"/> (the flash), and on
+        /// success consume a charge, start the cooldown, and run the ability's <see cref="HateAbilityDef.Action"/>
+        /// — whose steps apply cost effects to <paramref name="sources"/> and result effects to
+        /// <paramref name="targets"/>. Targeting is supplied (the game hands in the entity sets). Returns false if
+        /// the ability is undefined, ungranted, out of charges, or the predicate fails.
+        /// </summary>
+        public bool Activate(GameplayTag abilityTag, EntityId onEntity,
+            EntityId[] sources = null, EntityId[] targets = null, GameplayTagCollection injected = null)
+        {
+            if (!_hasAbilities || !_abilityDefs.TryGetValue((ulong)abilityTag, out HateAbilityDef def)) return false;
+
+            DataLensView view = GetTallInsertView(_abilitiesStore);
+            view.Refresh();
+            int row = FindAbilityRow(view, onEntity.Index, (ulong)abilityTag);
+            if (row < 0) return false;                               // not granted
+            if (view.Get<int>(row, _abChargesCol) < 1) return false; // no charges
+
+            // Eligibility predicate over the activator's flashed state. Advance the world stream through it (even on
+            // failure) so activations stay deterministic and reproducible.
+            EntityRecord subject = BuildEntityRecord(onEntity, _recordScratch);
+            // Merge caller-injected values (SetByCaller magnitudes, transient params) into the subject so predicates
+            // and effect magnitudes can read them by tag.
+            if (injected != null)
+                foreach ((GameplayTag tag, ulong value) in injected.GetAll())
+                    _recordScratch.Apply(tag, GameplayTagArithmetic.Set, value);
+            HateRng rng = _rng;
+            if (def.Predicate != null)
+            {
+                var pctx = new HatePredicateContext(subject, EntityId.None, rng);
+                bool ok = def.Predicate.Evaluate(ref pctx);
+                _rng = pctx.Rng;
+                if (!ok) return false;
+                rng = pctx.Rng;
+            }
+
+            // Consume a charge; start the recharge timer only if idle (mirrors the legacy path).
+            int remaining = view.Get<int>(row, _abChargesCol) - 1;
+            view.Set<int>(row, _abChargesCol, remaining);
+            if (view.Get<float>(row, _abCooldownCol) <= 0f && remaining < def.MaxCharges)
+                view.Set<float>(row, _abCooldownCol, (float)def.Cooldown);
+            view.SetState(row, ViewRowState.Modified);
+            view.Commit();
+
+            // Run the Action (cost -> Sources, result -> Targets, forks, events); instigator = the caster.
+            if (def.Action != null)
+            {
+                var actx = new HateActionContext(onEntity, sources, targets, onEntity, subject, rng);
+                def.Action.Execute(this, ref actx);
+                rng = actx.Rng;
+            }
+            _rng = rng;
+
+            AbilityActivated?.Invoke(onEntity, abilityTag);
+            return true;
+        }
+
+        /// <summary>Seed the deterministic world RNG (HATE-Spec §10) for reproducible Chance / ranged magnitude
+        /// (netcode-authoritative / replay). Call once after building the world.</summary>
+        public void Seed(ulong seed) => _rng = new HateRng(seed);
+
         // Evaluates one eligibility condition against an entity: an attribute comparison or a granted-tag test.
         private bool CasterMeets(EntityId entity, HateCondition c)
         {
@@ -1260,12 +1567,17 @@ namespace Heathen.HATE
             return ok;
         }
 
-        private int FindAbilityRow(DataLensView view, int entityIndex, ulong abilityTag)
+        private int FindAbilityRow(DataLensView view, ulong entityIndex, ulong abilityTag)
         {
+            var key = (entityIndex, abilityTag);
             int n = view.RowCount;
+            if (_abilityRowHint.TryGetValue(key, out int hint) && (uint)hint < (uint)n
+                && view.Get<ulong>(hint, _abEntityIndexCol) == entityIndex && view.Get<ulong>(hint, _abTagCol) == abilityTag)
+                return hint;
             for (int i = 0; i < n; i++)
-                if (view.Get<int>(i, _abEntityIndexCol) == entityIndex && view.Get<ulong>(i, _abTagCol) == abilityTag)
-                    return i;
+                if (view.Get<ulong>(i, _abEntityIndexCol) == entityIndex && view.Get<ulong>(i, _abTagCol) == abilityTag)
+                { _abilityRowHint[key] = i; return i; }
+            _abilityRowHint.Remove(key);
             return -1;
         }
 
@@ -1291,7 +1603,7 @@ namespace Heathen.HATE
                 return;
             }
             int r = view.AddRow();
-            view.Set<int>(r, _grEntityIndexCol, entity.Index);
+            view.Set<ulong>(r, _grEntityIndexCol, entity.Index);
             view.Set<ulong>(r, _grTagCol, (ulong)tag);
             view.Set<int>(r, _grRefCol, count);
             view.SetState(r, ViewRowState.New);
@@ -1370,7 +1682,7 @@ namespace Heathen.HATE
                 int n = view.RowCount;
                 bool any = false;
                 for (int i = 0; i < n; i++)
-                    if (view.Get<int>(i, kv.Value) == entity.Index)
+                    if (view.Get<ulong>(i, kv.Value) == entity.Index)
                     {
                         view.SetState(i, ViewRowState.Removed);
                         any = true;
@@ -1379,12 +1691,17 @@ namespace Heathen.HATE
             }
         }
 
-        private int FindTagRow(DataLensView view, int entityIndex, ulong tag)
+        private int FindTagRow(DataLensView view, ulong entityIndex, ulong tag)
         {
+            var key = (entityIndex, tag);
             int n = view.RowCount;
+            if (_tagRowHint.TryGetValue(key, out int hint) && (uint)hint < (uint)n
+                && view.Get<ulong>(hint, _grEntityIndexCol) == entityIndex && view.Get<ulong>(hint, _grTagCol) == tag)
+                return hint;
             for (int i = 0; i < n; i++)
-                if (view.Get<int>(i, _grEntityIndexCol) == entityIndex && view.Get<ulong>(i, _grTagCol) == tag)
-                    return i;
+                if (view.Get<ulong>(i, _grEntityIndexCol) == entityIndex && view.Get<ulong>(i, _grTagCol) == tag)
+                { _tagRowHint[key] = i; return i; }
+            _tagRowHint.Remove(key);
             return -1;
         }
 
@@ -1415,11 +1732,15 @@ namespace Heathen.HATE
             return _master;
         }
 
-        private static int FindRow(DataLensView view, int catalogIndex)
+        private int FindRow(DataLensView view, ulong catalogIndex)
         {
             int n = view.RowCount;
+            if (_masterRowHint.TryGetValue(catalogIndex, out int hint) && (uint)hint < (uint)n
+                && view.SourceRow(hint) == (long)catalogIndex)
+                return hint;
             for (int i = 0; i < n; i++)
-                if (view.SourceRow(i) == catalogIndex) return i;
+                if (view.SourceRow(i) == (long)catalogIndex) { _masterRowHint[catalogIndex] = i; return i; }
+            _masterRowHint.Remove(catalogIndex);
             return -1;
         }
 
