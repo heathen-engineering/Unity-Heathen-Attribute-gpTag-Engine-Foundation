@@ -2,7 +2,7 @@
 
 ![License](https://img.shields.io/badge/License-Apache_2.0-blue?style=flat-square)
 ![Maintained](https://img.shields.io/badge/Maintained%3F-yes-green?style=flat-square)
-![Unity](https://img.shields.io/badge/Unity-2021.3%20%2B-black?style=flat-square&logo=unity&logoColor=white)
+![Unity](https://img.shields.io/badge/Unity-2021.3%20%2B-%23313131?style=flat-square&logo=unity&logoColor=white)
 [![Dependency](https://img.shields.io/badge/Built_on-DataLens%20%2B%20GameplayTags-lightgrey?style=flat-square)](https://github.com/heathen-engineering/Unity-DataLens-Foundation)
 
 A data-oriented attribute / effect / ability system for Unity — our answer to Unreal's GAS, attribute-first and deliberately **not** OOP. State lives in [DataLens](https://github.com/heathen-engineering/Unity-DataLens-Foundation) columns and is addressed by [GameplayTags](https://github.com/heathen-engineering/Unity-GameplayTags-Foundation), so 100k+ actors with active buffs simulate as branchless column passes with zero per-effect GC objects.
@@ -82,7 +82,6 @@ authoring concepts, all GameplayTag-addressed and project-wide:
 - Unity **2021.3** or compatible
 - [**DataLens Foundation**](https://github.com/heathen-engineering/Unity-DataLens-Foundation) (`com.heathen.datalensfoundation`)
 - [**GameplayTags Foundation**](https://github.com/heathen-engineering/Unity-GameplayTags-Foundation) (`com.heathen.gameplaytags`)
-- [**Lexicon Foundation**](https://github.com/heathen-engineering/Unity-Lexicon-Localisation-Foundation) (`com.heathen.lexiconfoundation`) — localised display
 
 ## Namespaces
 
