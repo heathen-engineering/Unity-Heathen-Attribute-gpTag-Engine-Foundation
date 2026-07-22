@@ -1,3 +1,5 @@
+> **Migrating to Codeberg:** this repo is moving to [codeberg.org/Heathen-Engineering/Unity-Attribute-Tag-Engine-Foundation](https://codeberg.org/Heathen-Engineering/Unity-Attribute-Tag-Engine-Foundation) (renamed on Codeberg; still known as HATE elsewhere). GitHub will remain a read-only mirror during the transition.
+
 # Heathen Attribute [gameplay]Tag Engine (HATE) Foundation
 
 ![License](https://img.shields.io/badge/License-Apache_2.0-blue?style=flat-square)
